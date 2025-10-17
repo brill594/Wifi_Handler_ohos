@@ -4,6 +4,11 @@ import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:flutter/services.dart';
 import 'dart:ui' show FontFeature;
+import 'dart:convert';
+import 'dart:typed_data';
+
+
+
 
 // ===== In-app logger =====
 class InAppLog {
@@ -97,6 +102,16 @@ Future<Map<String, Map<String, dynamic>>> fetchSystemScanStandards() async {
 }
 
 
+Future<void> probePicker() async {
+  try {
+    final r = await _fileOps.invokeMethod<Map>('saveProbe', {
+      'fileName': 'probe_${DateTime.now().millisecondsSinceEpoch}.json'
+    });
+    InAppLog.d('saveProbe: $r'); // 这里能看到 uris
+  } catch (e) {
+    InAppLog.d('saveProbe ERROR: $e');
+  }
+}
 
 
 
@@ -374,6 +389,72 @@ class _HomePageState extends State<HomePage> {
 		});
 	}
 
+	Future<void> appendTextToUriJsonl({required String uri, required String text}) async {
+		try {
+			// 开始会话
+			final start = await _fileOps.invokeMethod<Map>('appendStart', {'uri': uri});
+			if (start?['ok'] != true) {
+				InAppLog.d('appendStart failed: $start');
+				if (!mounted) return;
+				ScaffoldMessenger.of(context).showSnackBar(
+					SnackBar(content: Text('打开文件失败：$start')),
+				);
+				return;
+			}
+			final sid = (start!['sid'] as num).toInt();
+
+			// 分块发送
+			final bytes = utf8.encode(text);
+			const chunk = 32 * 1024;
+			for (int i = 0; i < bytes.length; i += chunk) {
+				final end = (i + chunk < bytes.length) ? i + chunk : bytes.length;
+				final part = Uint8List.fromList(bytes.sublist(i, end));
+				await _fileOps.invokeMethod('appendChunk', {'sid': sid.toString(), 'bytes': part});
+			}
+
+			// 完成
+			await _fileOps.invokeMethod('appendFinish', {'sid': sid.toString()});
+		} catch (e) {
+			InAppLog.d('append error: $e');
+			if (!mounted) return;
+			ScaffoldMessenger.of(context).showSnackBar(
+				SnackBar(content: Text('追加失败：$e')),
+			);
+		}
+	}
+
+	// 通过 file_ops 分块保存
+	Future<void> exportJsonViaPickerChunked({required String fileName, required String jsonText}) async {
+		try {
+			// 1) 弹保存器并打开文件
+			final start = await _fileOps.invokeMethod<Map>('saveStart', {'fileName': fileName});
+			if (start?['ok'] != true) {
+				InAppLog.d('saveStart canceled or failed: $start');
+				if (!mounted) return;
+				ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已取消保存')));
+				return;
+			}
+			final sid = (start!['sid'] as num).toInt();
+
+			// 2) 分块发送
+			final bytes = utf8.encode(jsonText);
+			const chunk = 32 * 1024; // 32KB
+			for (int i = 0; i < bytes.length; i += chunk) {
+				final end = (i + chunk < bytes.length) ? i + chunk : bytes.length;
+				final part = Uint8List.fromList(bytes.sublist(i, end));
+				await _fileOps.invokeMethod('saveChunk', {'sid': sid.toString(), 'bytes': part});
+			}
+
+			// 3) 完成
+			await _fileOps.invokeMethod('saveFinish', {'sid': sid.toString()});
+			if (!mounted) return;
+			ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('导出完成')));
+		} catch (e) {
+			InAppLog.d('chunked save ERROR: $e');
+			if (!mounted) return;
+			ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('导出异常：$e')));
+		}
+	}
 
   @override
   void dispose() {
@@ -439,6 +520,8 @@ class _HomePageState extends State<HomePage> {
 
 	/// 先用 openUri 打开（ArkTS 侧已有），分享功能等你那边补 'shareUri' 再切换
 	Future<void> _probeChannels() async {
+		await probePicker();
+		await sanityProbe();
 		try {
 			final res = await _fileOps.invokeMethod('ping'); // 不写 <bool>
 			final ok = res == true || (res is Map && res['ok'] == true);
@@ -459,7 +542,36 @@ class _HomePageState extends State<HomePage> {
 			);
 		}
 	}
-	
+	Future<void> sanityProbe() async {
+  // 1) file_ops ping/echo
+  try {
+    final p1 = await _fileOps.invokeMethod('ping');
+    InAppLog.d('file_ops ping: $p1');
+  } catch (e) {
+    InAppLog.d('file_ops ping ERROR: $e');
+  }
+  try {
+    final e1 = await _fileOps.invokeMethod('echo', {'v': 'hi'});
+    InAppLog.d('file_ops echo: $e1');
+  } catch (e) {
+    InAppLog.d('file_ops echo ERROR: $e');
+  }
+
+  // 2) wifi_std ping/echo
+  try {
+    final p2 = await _wifiStdChannel.invokeMethod('ping');
+    InAppLog.d('wifi_std ping: $p2');
+  } catch (e) {
+    InAppLog.d('wifi_std ping ERROR: $e');
+  }
+  try {
+    final e2 = await _wifiStdChannel.invokeMethod('echo', {'v': 'hi'});
+    InAppLog.d('wifi_std echo: $e2');
+  } catch (e) {
+    InAppLog.d('wifi_std echo ERROR: $e');
+  }
+}
+
 	Future<void> exportJsonViaPickerStart({bool onlyCurrent = false}) async {
 		try {
 			InAppLog.d('Dart->ArkTS saveToDownloads: prepare payload');
@@ -476,6 +588,8 @@ class _HomePageState extends State<HomePage> {
 			final text = const JsonEncoder.withIndent('  ').convert(all);
 			final safe = text.length > 1000 ? text.substring(0, 1000) : text; // 临时截断
 			final fileName = 'wifi_scans_${DateTime.now().toIso8601String().replaceAll(':', '-')}.json';
+			final echo = await _fileOps.invokeMethod<Map>('echo', {'v': 'hi'});
+			InAppLog.d('echo: $echo');
 
 			InAppLog.d('Dart->ArkTS saveToDownloads: invoke');
 			final res = await _fileOps.invokeMethod<Map>('saveToDownloads', {
@@ -603,8 +717,36 @@ class _HomePageState extends State<HomePage> {
         title: const Text('Wi-Fi Analyzer'),
         actions: [
 					IconButton(
-						tooltip: '导出到 Downloads',
-						onPressed: () async { await exportJsonViaPickerStart(onlyCurrent: false); },
+						tooltip: '导出到 Downloads（同一文件追加）',
+						onPressed: aps.isEmpty ? null : () async {
+							try {
+								// 1) 组织一条“当前扫描”的记录
+								final entry = {
+									'timestamp': DateTime.now().toIso8601String(),
+									'remark': remarkCtrl.text.trim(),
+									'count': aps.length,
+									'results': aps.map((e) => e.toJson()).toList(),
+								};
+								final line = const JsonEncoder.withIndent('  ').convert(entry) + '\n'; // JSONL: 每条一行
+
+								if (_lastExportUri == null) {
+									// 2a) 第一次：让用户选择保存位置，并写入第一条
+									final fileName = 'wifi_scans_${DateTime.now().toIso8601String().replaceAll(':', '-')}.jsonl';
+									// 复用你已实现的「分块创建+写入」函数（saveStart/saveChunk/saveFinish）
+									await exportJsonViaPickerChunked(fileName: fileName, jsonText: line);
+									// onSaved 回调里会把 _lastExportUri 设好
+								} else {
+									// 2b) 后续：直接往已选文件末尾追加
+									await appendTextToUriJsonl(uri: _lastExportUri!, text: line);
+									if (!mounted) return;
+									ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已追加到上次的导出文件')));
+								}
+							} catch (e) {
+								InAppLog.d('export/append error: $e');
+								if (!mounted) return;
+								ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('导出异常：$e')));
+							}
+						},
 						icon: const Icon(Icons.download_outlined),
 					),
 

@@ -388,7 +388,183 @@ class _HomePageState extends State<HomePage> {
 			return null;
 		});
 	}
+	Future<void> appendCurrentScanVerbose() async {
+		if (_lastExportUri == null) {
+			ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请先设定导出文件')));
+			return;
+		}
+		if (aps.isEmpty) {
+			ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('当前没有数据可保存')));
+			return;
+		}
 
+		final entry = {
+			'timestamp': DateTime.now().toIso8601String(),
+			'remark': remarkCtrl.text.trim(),
+			'count': aps.length,
+			'results': aps.map((e) => e.toJson()).toList(),
+		};
+		final line = const JsonEncoder.withIndent('  ').convert(entry) + '\n';
+		final raw = utf8.encode(line);
+		InAppLog.d('append: rawLen=${raw.length}B');
+
+		try {
+			final start = await _fileOps.invokeMethod<Map>('appendStart', {'uri': _lastExportUri});
+			InAppLog.d('appendStart -> $start');
+			if (start?['ok'] != true) {
+				ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('打开文件失败')));
+				return;
+			}
+			final sid = (start!['sid'] as num).toInt();
+
+			const chunk = 24 * 1024;
+			int sent = 0, idx = 0;
+			for (int i = 0; i < raw.length; i += chunk) {
+				final end = (i + chunk < raw.length) ? i + chunk : raw.length;
+				final part = Uint8List.fromList(raw.sublist(i, end));
+				final b64 = base64Encode(part);
+				final r = await _fileOps.invokeMethod<Map>('appendChunk', {'sid': '$sid', 'b64': b64});
+				final wrote = (r?['wrote'] as num?)?.toInt() ?? -1;
+				sent += part.length;
+				idx++;
+				InAppLog.d('appendChunk #$idx raw=${part.length}B b64=${b64.length} sent=$sent/${
+						raw.length} wrote=$wrote');
+			}
+
+			final fin = await _fileOps.invokeMethod<Map>('appendFinish', {'sid': '$sid'});
+			InAppLog.d('appendFinish -> $fin');
+		} catch (e) {
+			InAppLog.d('export/append error: $e');
+			ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('保存失败：$e')));
+		}
+	}
+	
+	Future<void> createFileAndWriteFirstLine(String line) async {
+		final fileName = 'wifi_scans.jsonl'; // 固定文件名
+		final start = await _fileOps.invokeMethod<Map>('saveStart', {'fileName': fileName});
+		if (start?['ok'] != true) {
+			InAppLog.d('saveStart canceled/failed: $start');
+			return;
+		}
+		final sid = (start!['sid'] as num).toInt();
+
+		final bytes = Uint8List.fromList(utf8.encode(line));
+		const chunk = 24 * 1024; // base64 会膨胀，24KB 更稳
+		for (int i = 0; i < bytes.length; i += chunk) {
+			final end = (i + chunk < bytes.length) ? i + chunk : bytes.length;
+			final b64 = base64Encode(bytes.sublist(i, end));
+			await _fileOps.invokeMethod('saveChunk', {'sid': '$sid', 'b64': b64});
+		}
+		await _fileOps.invokeMethod('saveFinish', {'sid': '$sid'});
+	}
+	
+	Future<void> appendLineToKnownUri(String uri, String line) async {
+		final start = await _fileOps.invokeMethod<Map>('appendStart', {'uri': uri});
+		if (start?['ok'] != true) {
+			InAppLog.d('appendStart failed: $start');
+			return;
+		}
+		final sid = (start!['sid'] as num).toInt();
+
+		final bytes = Uint8List.fromList(utf8.encode(line));
+		const chunk = 24 * 1024;
+		for (int i = 0; i < bytes.length; i += chunk) {
+			final end = (i + chunk < bytes.length) ? i + chunk : bytes.length;
+			final b64 = base64Encode(bytes.sublist(i, end));
+			await _fileOps.invokeMethod('appendChunk', {'sid': '$sid', 'b64': b64});
+		}
+		await _fileOps.invokeMethod('appendFinish', {'sid': '$sid'});
+	}
+	Future<void> exportOrAppendCurrent() async {
+		if (aps.isEmpty) {
+			ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('当前没有数据可保存')));
+			return;
+		}
+
+		final entry = {
+			'timestamp': DateTime.now().toIso8601String(),
+			'remark': remarkCtrl.text.trim(),
+			'count': aps.length,
+			'results': aps.map((e) => e.toJson()).toList(),
+		};
+		final line = const JsonEncoder.withIndent('  ').convert(entry) + '\n'; // JSONL: 一条一行
+
+		if (_lastExportUri == null) {
+			await createFileAndWriteFirstLine(line);   // 第一次：创建固定文件
+			// onSaved 回调里会把 _lastExportUri 设为新文件的 URI（你已有）
+		} else {
+			await appendLineToKnownUri(_lastExportUri!, line); // 后续：直接追加
+		}
+	}
+		
+	Future<void> chooseExportFile() async {
+		try {
+			final r = await _fileOps.invokeMethod<Map>('chooseSaveUri', {'baseName': 'wifi_scans'});
+			if (r?['ok'] == true && r?['uri'] is String) {
+				setState(() => _lastExportUri = r!['uri'] as String);
+				InAppLog.d('chooseExportFile -> $_lastExportUri');
+				// 建议同时持久化（可选）
+				// final sp = await SharedPreferences.getInstance();
+				// await sp.setString('export_uri', _lastExportUri!);
+				ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已设定导出文件')));
+			} else {
+				ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已取消选择')));
+			}
+		} catch (e) {
+			InAppLog.d('chooseExportFile ERROR: $e');
+			ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('设定失败：$e')));
+		}
+	}
+
+	Future<void> appendCurrentScan() async {
+		if (_lastExportUri == null) {
+			ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请先设定导出文件')));
+			return;
+		}
+		if (aps.isEmpty) {
+			ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('当前没有数据可保存')));
+			return;
+		}
+
+		// 组织一条 JSONL 行
+		final entry = {
+			'timestamp': DateTime.now().toIso8601String(),
+			'remark': remarkCtrl.text.trim(),
+			'count': aps.length,
+			'results': aps.map((e) => e.toJson()).toList(),
+		};
+		final line = const JsonEncoder.withIndent('  ').convert(entry) + '\n';
+
+		try {
+			// 可选：判断文件是否存在
+			final st = await _fileOps.invokeMethod<Map>('statUri', {'uri': _lastExportUri});
+			if (st?['ok'] == true && st?['exists'] == false) {
+				ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('目标文件不存在，请重新设定')));
+				return;
+			}
+
+			final start = await _fileOps.invokeMethod<Map>('appendStart', {'uri': _lastExportUri});
+			if (start?['ok'] != true) {
+				InAppLog.d('appendStart failed: $start');
+				ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('打开文件失败')));
+				return;
+			}
+			final sid = (start!['sid'] as num).toInt();
+
+			final bytes = Uint8List.fromList(utf8.encode(line));
+			const chunk = 24 * 1024; // base64 会膨胀，24KB 更稳
+			for (int i = 0; i < bytes.length; i += chunk) {
+				final end = (i + chunk < bytes.length) ? i + chunk : bytes.length;
+				final b64 = base64Encode(bytes.sublist(i, end));
+				await _fileOps.invokeMethod('appendChunk', {'sid': '$sid', 'b64': b64});
+			}
+			await _fileOps.invokeMethod('appendFinish', {'sid': '$sid'});
+			// onSaved 回调会提示“已导出：uri”
+		} catch (e) {
+			InAppLog.d('appendCurrentScan ERROR: $e');
+			ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('保存失败：$e')));
+		}
+	}
 	Future<void> appendTextToUriJsonl({required String uri, required String text}) async {
 		try {
 			// 开始会话
@@ -714,39 +890,17 @@ class _HomePageState extends State<HomePage> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Wi-Fi Analyzer'),
         actions: [
 					IconButton(
-						tooltip: '导出到 Downloads（同一文件追加）',
-						onPressed: aps.isEmpty ? null : () async {
-							try {
-								// 1) 组织一条“当前扫描”的记录
-								final entry = {
-									'timestamp': DateTime.now().toIso8601String(),
-									'remark': remarkCtrl.text.trim(),
-									'count': aps.length,
-									'results': aps.map((e) => e.toJson()).toList(),
-								};
-								final line = const JsonEncoder.withIndent('  ').convert(entry) + '\n'; // JSONL: 每条一行
+						tooltip: '设定导出文件（wifi_scans.jsonl）',
+						onPressed: chooseExportFile,
+						icon: const Icon(Icons.create_new_folder_outlined),
+					),
 
-								if (_lastExportUri == null) {
-									// 2a) 第一次：让用户选择保存位置，并写入第一条
-									final fileName = 'wifi_scans_${DateTime.now().toIso8601String().replaceAll(':', '-')}.jsonl';
-									// 复用你已实现的「分块创建+写入」函数（saveStart/saveChunk/saveFinish）
-									await exportJsonViaPickerChunked(fileName: fileName, jsonText: line);
-									// onSaved 回调里会把 _lastExportUri 设好
-								} else {
-									// 2b) 后续：直接往已选文件末尾追加
-									await appendTextToUriJsonl(uri: _lastExportUri!, text: line);
-									if (!mounted) return;
-									ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已追加到上次的导出文件')));
-								}
-							} catch (e) {
-								InAppLog.d('export/append error: $e');
-								if (!mounted) return;
-								ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('导出异常：$e')));
-							}
-						},
+					// 步骤 2：把本次扫描追加到同一个文件
+					IconButton(
+						tooltip: '保存当前（追加到同一文件）',
+						onPressed: appendCurrentScanVerbose,
 						icon: const Icon(Icons.download_outlined),
 					),
 
@@ -760,8 +914,6 @@ class _HomePageState extends State<HomePage> {
 			
           IconButton(tooltip: '历史', onPressed: _openHistory, icon: const Icon(Icons.history)),
           IconButton(tooltip: '打开 JSON', onPressed: _openJson, icon: const Icon(Icons.insert_drive_file_outlined)),
-          IconButton(tooltip: '保存 JSON', onPressed: hasData ? saveToJson : null, icon: const Icon(Icons.save_alt)),
-          IconButton(tooltip: '重新扫描', onPressed: scanning ? null : scanOnce, icon: const Icon(Icons.refresh)),
 					IconButton(
 						tooltip: '自检通道',
 						onPressed: _probeChannels,

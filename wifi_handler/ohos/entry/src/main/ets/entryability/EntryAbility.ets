@@ -8,23 +8,44 @@ import { BusinessError } from '@ohos.base';
 import window from '@ohos.window';
 import type { UIContext } from '@ohos.arkui.UIContext';
 
-// ===== 放在顶部（emitLog 附近）=====
+async function writeBytes(fd: number, buf: Uint8Array): Promise<number> {
+  return await fs.write(fd, buf.buffer, {
+    offset: buf.byteOffset,
+    length: buf.byteLength,
+  });
+}
 
-interface SaveSession { fd: number; uri: string }
+function fmtBytes(n: number): string {
+  if (n >= 1 << 20) return `${(n / (1 << 20)).toFixed(2)}MB`;
+  if (n >= 1 << 10) return `${(n / (1 << 10)).toFixed(2)}KB`;
+  return `${n}B`;
+}
+interface SaveSession { fd: number; uri: string; bytes: number; chunks: number; t0: number; }
 const saveSessions = new Map<number, SaveSession>();
 let nextSid = 1;
 
-// 从平台通道参数里拿出字节（不使用 any/unknown）
+
 function getBytesArg(call: MethodCall, key: string): Uint8Array {
-  const mc = call as HasArgument;               // 你已有：interface HasArgument { argument?: ArgFn }
-  const v = mc.argument ? (mc.argument(key)) : undefined;
+  const mc = call as HasArgument;
+  const v = (typeof mc.argument === 'function') ? mc.argument(key) : undefined;
 
+  // 来自 Dart 的 Uint8List → Uint8Array
   if (v instanceof Uint8Array) return v;
-  if (v instanceof ArrayBuffer) return new Uint8Array(v as ArrayBuffer);
-  if (Array.isArray(v)) return new Uint8Array(v as number[]); // 兼容 number[]
-  throw new Error('bad bytes');
-}
 
+  // 一些机型会变成 ArrayBuffer
+  if (v instanceof ArrayBuffer) return new Uint8Array(v as ArrayBuffer);
+
+  // 少数桥接会给 number[]（逐字节）
+  if (Array.isArray(v)) {
+    const arr = v as number[];
+    return new Uint8Array(arr);
+  }
+
+  // 万不得已：字符串也能写（例如调试）
+  if (typeof v === 'string') return utf8Encode(v);
+
+  throw new Error('Invalid argument');
+}
 type Throwable =
   | Error
   | BusinessError
@@ -67,7 +88,9 @@ function emitLog(msg: string) {
   }
 }
 
-interface HasArgument { argument?: ArgFn }
+interface HasArgument {
+  argument?: (key: string) => string | number | boolean | object | null | undefined;
+}
 type ArgFn = (key: string) =>
 string | number | boolean | object | null | undefined;
 
@@ -75,6 +98,48 @@ function getStrArg(call: MethodCall, key: string, defVal: string): string {
   const mc = call as HasArgument;
   const v = (typeof mc.argument === 'function') ? mc.argument(key) : undefined;
   return (typeof v === 'string') ? v : defVal;
+}
+
+function v(ch: number): number {
+  // 'A'-'Z'
+  if (ch >= 65 && ch <= 90) return ch - 65;
+  // 'a'-'z'
+  if (ch >= 97 && ch <= 122) return ch - 71; // 97-26
+  // '0'-'9'
+  if (ch >= 48 && ch <= 57) return ch + 4;   // 52..61
+  // '+'
+  if (ch === 43) return 62;
+  // '/'
+  if (ch === 47) return 63;
+  // '=' or others
+  return 0;
+}
+function b64ToBytes(b64: string): Uint8Array {
+  // 只保留合法字符
+  const s = b64.replace(/[^A-Za-z0-9+/=]/g, '');
+  const len = s.length;
+  let pad = 0;
+  if (len >= 2) {
+    if (s.charAt(len - 1) === '=') pad++;
+    if (s.charAt(len - 2) === '=') pad++;
+  }
+  const outLen = (len >> 2) * 3 - pad;
+  const out = new Uint8Array(outLen);
+
+  let o = 0;
+  let i = 0;
+  while (i < len) {
+    const c1 = v(s.charCodeAt(i++));
+    const c2 = v(s.charCodeAt(i++));
+    const c3 = v(s.charCodeAt(i++));
+    const c4 = v(s.charCodeAt(i++));
+    const trip = (c1 << 18) | (c2 << 12) | (c3 << 6) | c4;
+
+    if (o < outLen) out[o++] = (trip >> 16) & 0xFF;
+    if (o < outLen) out[o++] = (trip >> 8) & 0xFF;
+    if (o < outLen) out[o++] = trip & 0xFF;
+  }
+  return out;
 }
 
 function utf8Encode(s: string): Uint8Array {
@@ -225,7 +290,7 @@ async function saveJsonToDownloads(ctx: common.UIAbilityContext, fileName: strin
     emitLog(`ArkTS: fs.open ok fd=${fh.fd}`);
 
     emitLog(`ArkTS: fs.write ${data.byteLength}B`);
-    await fs.write(fh.fd, data);
+    await writeBytes(fh.fd, data);
     emitLog('ArkTS: fs.write ok');
 
     return target;
@@ -244,11 +309,10 @@ async function saveJsonToDownloads(ctx: common.UIAbilityContext, fileName: strin
 }
 
 async function openUri(ctx: common.UIAbilityContext, target: string): Promise<void> {
-  const want: Want = {
-    action: 'ohos.want.action.viewData',
-    uri: target,
-    type: 'application/json',
-  };
+  let mime = 'application/json';
+  const low = target.toLowerCase();
+  if (low.endsWith('.jsonl')) mime = 'text/plain';
+  const want: Want = { action: 'ohos.want.action.viewData', uri: target, type: mime };
   await ctx.startAbility(want);
 }
 
@@ -316,85 +380,134 @@ export default class EntryAbility extends FlutterAbility {
         return;
       }
       // ① 选择保存位置并打开句柄，返回 sid
-      if (call.method === 'saveStart') {
-        const fileName = getStrArg(call, 'fileName', 'wifi_scans.json');
-        const abilityCtx = this.context as common.UIAbilityContext;
-
-        const view = new picker.DocumentViewPicker(abilityCtx);
-        const opts = new picker.DocumentSaveOptions();
-        opts.newFileNames = [fileName];
-        opts.fileSuffixChoices = ['json'];
-
-        const uris: string[] = await view.save(opts);
-        if (!uris || uris.length === 0) { result.success({ ok: false, canceled: true }); return; }
-
-        const uri = uris[0];
-        const fh = await fs.open(uri, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE); // 不带 TRUNC，更通用
-        const sid = nextSid++;
-
-        saveSessions.set(sid, { fd: fh.fd, uri });
-        emitLog(`ArkTS: saveStart ok sid=${sid} uri=${uri}`);
-        result.success({ ok: true, sid, uri });
-        return;
-      }
       // ① 追加：用已知 uri 打开文件并定位到末尾，返回 sid
       // ① 追加：用已知 uri 打开文件并定位到末尾，返回 sid
       if (call.method === 'appendStart') {
         const uri = getStrArg(call, 'uri', '');
         if (!uri) { result.success({ ok: false, message: 'empty uri' }); return; }
 
-        // 只用强类型：READ_WRITE | CREATE | APPEND
-        const fh = await fs.open(uri, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.APPEND);
-
-        // 如果已有内容，先补一个换行，保证 JSONL 每条独占一行
+        emitLog(`[file_ops] appendStart uri=${uri}`);
+        let fh: fs.File;
         try {
-          const st = await fs.stat(uri);
-          if (st.size > 0) { await fs.write(fh.fd, new Uint8Array([10])); }
-        } catch { /* stat 失败可忽略 */ }
+          fh = await fs.open(uri, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.APPEND);
+        } catch {
+          fh = await fs.open(uri, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE);
+        }
+
+        let before = -1;
+        try { const st = await fs.stat(uri); before = st.size; } catch {}
+        if (before > 0) { try { await writeBytes(fh.fd, new Uint8Array([10]));} catch {} }
 
         const sid = nextSid++;
-        saveSessions.set(sid, { fd: fh.fd, uri });
-        emitLog(`ArkTS: appendStart ok sid=${sid}`);
+        saveSessions.set(sid, { fd: fh.fd, uri, bytes: 0, chunks: 0, t0: Date.now() });
+        emitLog(`[file_ops] appendStart ok sid=${sid} sizeBefore=${before >= 0 ? fmtBytes(before) : 'NA'}`);
         result.success({ ok: true, sid, uri });
         return;
       }
+
 
       // ② 追加：写入一块
       if (call.method === 'appendChunk') {
         const sid = Number(getStrArg(call, 'sid', '0'));
         const sess = saveSessions.get(sid);
         if (!sess) { result.success({ ok: false, message: 'bad sid' }); return; }
-        const bytes = getBytesArg(call, 'bytes');
-        await fs.write(sess.fd, bytes);
-        result.success({ ok: true, wrote: bytes.byteLength });
+
+        // 优先 b64
+        const b64 = getStrArg(call, 'b64', '');
+        let payload: Uint8Array | null = null;
+        let origin = 'b64';
+        if (b64.length > 0) {
+          payload = b64ToBytes(b64);
+        } else {
+          // 兼容老的 bytes（如果仍在调用 saveChunk/appendChunk 传 bytes）
+          const mc = call as HasArgument;
+          const v = (typeof mc.argument === 'function') ? mc.argument('bytes') : undefined;
+          if (v instanceof Uint8Array) payload = v;
+          else if (v instanceof ArrayBuffer) payload = new Uint8Array(v);
+          else if (Array.isArray(v)) payload = new Uint8Array(v as number[]);
+          origin = 'bytes';
+        }
+
+        if (!payload) { result.success({ ok: false, message: 'no payload' }); return; }
+
+        await writeBytes(sess.fd, payload);
+        sess.bytes += payload.byteLength;
+        sess.chunks += 1;
+        emitLog(`[file_ops] appendChunk sid=${sid} origin=${origin} wrote=${fmtBytes(payload.byteLength)} acc=${fmtBytes(sess.bytes)} #${sess.chunks}`);
+        result.success({ ok: true, wrote: payload.byteLength });
+        return;
+      }
+      if (call.method === 'statUri') {
+        const uri = getStrArg(call, 'uri', '');
+        if (!uri) { result.success({ ok: false, message: 'empty uri' }); return; }
+        try {
+          const st = await fs.stat(uri);
+          result.success({ ok: true, exists: true, size: st.size });
+        } catch {
+          result.success({ ok: true, exists: false, size: 0 });
+        }
         return;
       }
 
-      // ③ 追加：完成并关闭（回推 onSaved）
       if (call.method === 'appendFinish') {
         const sid = Number(getStrArg(call, 'sid', '0'));
         const sess = saveSessions.get(sid);
         if (!sess) { result.success({ ok: false, message: 'bad sid' }); return; }
+
+        let after = -1;
+        try { const st = await fs.stat(sess.uri); after = st.size; } catch {}
+
         try { await fs.close(sess.fd); } catch {}
+        const dur = Date.now() - sess.t0;
+        emitLog(`[file_ops] appendFinish sid=${sid} total=${fmtBytes(sess.bytes)} chunks=${sess.chunks} in ${dur}ms sizeAfter=${after >= 0 ? fmtBytes(after) : 'NA'}`);
         saveSessions.delete(sid);
-        await this.fileCh?.invokeMethod('onSaved', { ok: true, uri: sess.uri }); // 复用你已有的回推
-        emitLog('ArkTS: onSaved(ok) sent (append)');
+
+        await this.fileCh?.invokeMethod('onSaved', { ok: true, uri: sess.uri });
         result.success({ ok: true, uri: sess.uri });
         return;
       }
 
+      if (call.method === 'chooseSaveUri') {
+        let base = getStrArg(call, 'baseName', 'wifi_scans');
+        if (!base.endsWith('.jsonl') && !base.endsWith('.json')) base = `${base}.jsonl`; // 统一默认 jsonl
+
+        const ctx = this.context as common.UIAbilityContext;
+        const view = new picker.DocumentViewPicker(ctx);
+        const opts = new picker.DocumentSaveOptions();
+        opts.newFileNames = [base];          // 某些机型不会自动加句点，直接给完整名最稳
+        // 不设置 fileSuffixChoices，避免出现 "wifi_scansjson"
+
+        try {
+          const uris: string[] = await view.save(opts);
+          emitLog(`[file_ops] chooseSaveUri opts.base=${base} -> ${JSON.stringify(uris)}`);
+          if (!uris || uris.length === 0) { result.success({ ok: false, canceled: true }); return; }
+          result.success({ ok: true, uri: uris[0] });
+        } catch (e) {
+          const err = normalizeError(e);
+          emitLog(`[file_ops] chooseSaveUri ERROR: ${err.message}`);
+          result.error('500', err.message, null);
+        }
+        return;
+      }
+
+
       // ② 逐块写
       if (call.method === 'saveChunk') {
-        const sidStr = getStrArg(call, 'sid', '0');
-        const sid = Number(sidStr);
+        const sid = Number(getStrArg(call, 'sid', '0'));
         const sess = saveSessions.get(sid);
         if (!sess) { result.success({ ok: false, message: 'bad sid' }); return; }
 
-        const bytes = getBytesArg(call, 'bytes');
-        await fs.write(sess.fd, bytes);
+        const b64 = getStrArg(call, 'b64', '');
+        if (b64.length === 0) { result.success({ ok: false, message: 'empty b64' }); return; }
+
+        const bytes = b64ToBytes(b64);
+        await writeBytes(sess.fd, bytes);
+        emitLog(`ArkTS onFileOps: saveChunk wrote=${bytes.byteLength}`);
         result.success({ ok: true, wrote: bytes.byteLength });
         return;
       }
+
+
 
       // ③ 完成并关闭
       if (call.method === 'saveFinish') {

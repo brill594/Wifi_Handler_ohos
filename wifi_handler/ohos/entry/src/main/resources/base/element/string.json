@@ -1,0 +1,12 @@
+{
+  "string": [
+    {
+      "name": "reason_location_wifi_scan",
+      "value": "用于扫描周边 Wi-Fi（系统可能需要位置信息以返回扫描列表）"
+    },
+    {
+      "name": "reason_location_wifi_scan_approx",
+      "value": "用于扫描周边 Wi-Fi（模糊定位）"
+    }
+  ]
+}

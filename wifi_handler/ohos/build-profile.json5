@@ -1,0 +1,60 @@
+{
+  "app": {
+    "signingConfigs": [
+      {
+        "name": "releaseSign",
+        "type": "HarmonyOS",
+        "material": {
+          "storeFile": "signing/release/key.p12",
+          "storePassword": "0000001AC75FDB207455925E8D744338D0A016C24B8F13F0D83D91C73979DBB58454D4BA9418656390FC",
+          "keyAlias": "wh",
+          "keyPassword": "0000001A8DF1E3D10B08E05C9964258BB47A83CEC86D5D82A7E5C9420CA66EF140D55B34B3F74C1A99D3",
+          "signAlg": "SHA256withECDSA",
+          "profile": "signing/release/An.Release.p7b",
+          "certpath": "signing/release/wifi_handler.cer"
+        }
+      }
+    ],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "releaseSign",
+        "compatibleSdkVersion": "5.1.0(18)",
+        "runtimeOS": "HarmonyOS",
+        "buildOption": {
+          "externalNativeOptions": {
+            "abiFilters": [
+              "arm64-v8a"
+            ]
+          }
+        },
+        "targetSdkVersion": "5.1.0(18)"
+      }
+    ],
+    "buildModeSet": [
+      {
+        "name": "debug"
+      },
+      {
+        "name": "profile"
+      },
+      {
+        "name": "release"
+      }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        }
+      ]
+    }
+  ]
+}

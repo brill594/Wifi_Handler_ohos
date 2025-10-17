@@ -1,0 +1,40 @@
+name: wifi_analyzer
+description: "HarmonyOS Flutter app"
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"   # 对应 Flutter 3.22 的 Dart 3.4.x
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # HarmonyOS：获取当前连接信息
+  network_info_plus: ^6.0.0
+  network_info_plus_ohos: any
+  # —— 权限（Dart 3.4 可用）——
+  permission_handler: ^11.3.1
+  permission_handler_ohos: ^0.0.7
+
+  # —— 路径/目录（鸿蒙实现）——
+  path_provider:
+    git:
+      url: https://gitcode.com/OpenHarmony-SIG/flutter_packages.git
+      path: packages/path_provider/path_provider
+
+  # —— 打开文件（鸿蒙实现）——
+  open_file_ohos: ^1.0.0
+
+  # 纯 Dart 资源，保留无碍
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  # 注意 5.x 需要 Dart >=3.5，这里锁 4.x 以兼容 Dart 3.4
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true

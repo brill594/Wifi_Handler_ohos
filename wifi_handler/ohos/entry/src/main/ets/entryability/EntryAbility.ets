@@ -127,6 +127,16 @@ interface WifiStdOut {
 
 /* ---------- 小工具 ---------- */
 /* 字段对齐与容错 */
+/* WifiCategory -> Android-like wifiStandard code */
+function mapWifiCategoryToStdCode(cat: number | null): number | null {
+  // Harmony: 1=DEFAULT(≤WiFi6), 2=WiFi6, 3=WiFi6+, 4=WiFi7, 5=WiFi7+
+  if (cat === 4 || cat === 5) return 7;   // 802.11be (Wi-Fi 7 / 7+)
+  if (cat === 2 || cat === 3) return 6;   // 802.11ax (Wi-Fi 6 / 6+)
+  // 其余（1 或 null）都当作未知/旧标准，让 Dart 继续走 capabilities 兜底
+  return null;
+}
+
+/* 打包输出（替换你现在的 packOut 同名部分） */
 function packOut(it: WifiScanInfo): WifiStdOut {
   const ssid = it.ssid ?? '';
   const bssid = (it.bssid ?? '').toLowerCase();
@@ -134,11 +144,12 @@ function packOut(it: WifiScanInfo): WifiStdOut {
   const frequency = (it.frequency ?? 0) as number;
   const capabilities = it.capabilities ?? '';
 
-  const wifiStandardCode = (it.supportedWifiCategory ?? null) as number | null;
-  const wifiStandardRaw = wifiStandardCode !== null ? String(wifiStandardCode) : null;
+  const cat: number | null = (it.supportedWifiCategory ?? null) as number | null;
+  const wifiStandardCode = mapWifiCategoryToStdCode(cat);     // ← 关键：映射后给 Dart
+  const wifiStandardRaw = cat !== null ? `WIFI_CATEGORY_${cat}` : null;
 
   const channelWidthCode = (it.channelWidth ?? null) as number | null;
-  const channelWidthRaw = null; // 5.x 这里没有稳定的 name，保持 null
+  const channelWidthRaw = null;
 
   const centerFreq0 = (it.centerFrequency0 ?? null) as number | null;
   const centerFreq1 = (it.centerFrequency1 ?? null) as number | null;
@@ -150,6 +161,7 @@ function packOut(it: WifiScanInfo): WifiStdOut {
     centerFreq0, centerFreq1
   };
 }
+
 
 /* ---------- 扫描实现：带节流与去重 ---------- */
 let lastScanAt = 0;
@@ -294,7 +306,6 @@ export default class EntryAbility extends FlutterAbility {
                 emitLog(`ArkTS: onSaved(fail) ${String(e)}`);
               }
             })();
-
             return;
           }
 
@@ -330,6 +341,24 @@ export default class EntryAbility extends FlutterAbility {
         emitLog(`ArkTS<-Dart [wifi] ${call.method}`);
         try {
           if (call.method === 'ping') { result.success({ ok: true, from: 'arkts:wifi' }); return; }
+          if (call.method === 'saveToDownloads') {
+            try {
+              const fileName = getStrArg(call, 'fileName', 'wifi_scans.json');
+              const text = getStrArg(call, 'text', '');
+              result.success({ ok: true, pending: true }); // 立即返回
+              (async () => {
+                try {
+                  const uri = await saveJsonToDownloads(this.context as common.UIAbilityContext, fileName, text);
+                  await this.fileCh?.invokeMethod('onSaved', { ok: true, uri });
+                } catch (e) {
+                  await this.fileCh?.invokeMethod('onSaved', { ok: false, message: String(e) });
+                }
+              })();
+            } catch (e) {
+              result.error('500', String(e), null);
+            }
+            return;
+          }
 
           if (call.method === 'scanAndGet') {
             try {

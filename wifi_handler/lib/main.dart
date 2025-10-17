@@ -215,6 +215,16 @@ class AP {
   };
 }
 
+String prettyFromWifiCategoryRaw(String? raw) {
+  switch (raw) {
+    case 'WIFI_CATEGORY_5': return 'Wi-Fi 7+';
+    case 'WIFI_CATEGORY_4': return 'Wi-Fi 7';
+    case 'WIFI_CATEGORY_3': return 'Wi-Fi 6+';
+    case 'WIFI_CATEGORY_2': return 'Wi-Fi 6';
+    case 'WIFI_CATEGORY_1': return '≤ Wi-Fi 6';
+  }
+  return '—';
+}
 
 enum Band { any, b24, b5, b6 }
 
@@ -464,12 +474,13 @@ class _HomePageState extends State<HomePage> {
 						]
 					: await _readAllEntries();
 			final text = const JsonEncoder.withIndent('  ').convert(all);
+			final safe = text.length > 1000 ? text.substring(0, 1000) : text; // 临时截断
 			final fileName = 'wifi_scans_${DateTime.now().toIso8601String().replaceAll(':', '-')}.json';
 
 			InAppLog.d('Dart->ArkTS saveToDownloads: invoke');
 			final res = await _fileOps.invokeMethod<Map>('saveToDownloads', {
 				'fileName': fileName,
-				'text': text,
+				'text': safe,
 			});
 
 			InAppLog.d('Dart<-ArkTS saveToDownloads immediate: $res');
@@ -751,7 +762,7 @@ class _ApTable extends StatelessWidget {
               const Divider(height: 16),
               _kv('标准', ap.standard),
               _kv('系统 wifiStandardCode', ap.wifiStandardCode?.toString() ?? '—'),
-              _kv('系统 wifiStandardRaw', ap.wifiStandardRaw?.toString() ?? '—'),
+							_kv('系统级别(HW)', prettyFromWifiCategoryRaw(ap.wifiStandardRaw)),
               _kv('channelWidthRaw', ap.channelWidthRaw ?? '—'),
               _kv('centerFreq0 / 1', '${ap.centerFreq0 ?? '—'} / ${ap.centerFreq1 ?? '—'} MHz'),
               _kv('频率 / 信道', '${ap.frequency} MHz / ch ${ap.channel}'),

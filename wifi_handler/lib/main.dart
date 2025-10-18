@@ -151,7 +151,7 @@ String determineWifiStandard({
     case 6: return '802.11ax';
     case 5: return '802.11ac';
     case 4: return '802.11n';
-    case 1: return (freq < 2500) ? '802.11b/g' : '802.11a';
+    case 1: return (freq < 2500) ? '802.11ac及以下' : '802.11ac及以下';
   }
 
   // --- 第二层：如果 Code 不可靠，解析 capabilities 字符串 (最重要！) ---
@@ -159,16 +159,16 @@ String determineWifiStandard({
   // 必须从新到旧判断，因为新标准会兼容旧标准的标识
   if (caps.contains('EHT')) return '802.11be';
   if (caps.contains('HE')) return '802.11ax';
-  if (caps.contains('VHT')) return '802.11ac';
+  if (caps.contains('VHT')) return '802.11ac及以下';
   if (caps.contains('HT')) return '802.11n';
 
   // --- 第三层：如果 capabilities 也无效，启用最终兜底 ---
   if (freq >= 5955) return '802.11ax/be'; // 6GHz 频段
   if (bw >= 320) return '802.11be';
   if (bw >= 160) return '802.11ac/ax/be'; // 160MHz 可能是 ac/ax/be
-  if (bw >= 80)  return '802.11ac/ax';   // 80MHz 可能是 ac/ax
+  if (bw >= 80)  return '802.11ac/ax(系统未返回)';   // 80MHz 可能是 ac/ax
   if (bw == 40)  return '802.11n';
-  return (freq < 2500) ? '802.11b/g' : '802.11a';
+  return (freq < 2500) ? '802.11ac及以下' : '802.11ac及以下';
 }
 
 // WifiManager 的 channelWidth 常量转 MHz

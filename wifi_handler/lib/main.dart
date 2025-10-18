@@ -1437,6 +1437,7 @@ class _HistoryPageState extends State<HistoryPage> {
 
 
 /* ------------------------------ 绘图（平顶台形） ------------------------------ */
+typedef _ChannelRange = ({double start, double end});
 
 class WifiChartPainter extends CustomPainter {
   final List<AP> aps;
@@ -1460,104 +1461,148 @@ class WifiChartPainter extends CustomPainter {
     final gridColor = (brightness == Brightness.dark ? Colors.white70 : Colors.black87).withOpacity(0.22);
     final axisColor = gridColor.withOpacity(0.55);
 
-    // 水平网格
+    // Draw Y-axis grid and labels (no changes here)
     final grid = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 0.5
-      ..color = gridColor;
+      ..style = PaintingStyle.stroke..strokeWidth = 0.5..color = gridColor;
     const rows = 7;
     for (int i = 0; i <= rows; i++) {
       final y = chart.top + i * chart.height / rows;
       canvas.drawLine(Offset(chart.left, y), Offset(chart.right, y), grid);
     }
-
-    // 外框
     final axis = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 1
-      ..color = axisColor;
+      ..style = PaintingStyle.stroke..strokeWidth = 1..color = axisColor;
     canvas.drawRect(chart, axis);
 
-    // 仅占用信道决定范围
-    final occupied = aps.map((e) => e.channel).where((c) => c > 0).toSet().toList()..sort();
-    int minCh, maxCh;
-    if (occupied.isEmpty) {
-      minCh = 1;
-      maxCh = 165;
-    } else {
-      minCh = (occupied.first - 3).clamp(1, 1000);
-      maxCh = (occupied.last + 3).clamp(minCh + 10, 1000);
-    }
-
-    double xOf(num ch) => chart.left + ((ch - minCh) / (maxCh - minCh)) * chart.width;
     double yOf(int rssi) {
       final rr = rssi.clamp(minRssi, maxRssi).toDouble();
       final t = (rr - minRssi) / (maxRssi - minRssi);
       return chart.bottom - t * chart.height;
     }
-
-		// 刻度
     for (int r = -100; r <= -30; r += 10) {
       final y = yOf(r);
       _drawText(canvas, '$r dBm', Offset(padding.left - 44, y - 7),
           TextStyle(fontSize: 11, color: textColor.withOpacity(0.75)));
     }
-    if (occupied.isNotEmpty) {
-      // 移除 step 逻辑，直接遍历所有占用的信道
-      for (final ch in occupied) {
-        final x = xOf(ch);
-        canvas.drawLine(Offset(x, chart.bottom), Offset(x, chart.bottom + 4), axis);
-        _drawText(canvas, '$ch', Offset(x - 6, chart.bottom + 6),
-            TextStyle(fontSize: 11, color: textColor.withOpacity(0.75)));
+
+    // --- NEW LOGIC: Dynamic X-Axis based on active channels ---
+    if (aps.where((e) => e.channel > 0).isEmpty) {
+      _drawText(canvas, '信道 (Channel)', Offset(chart.right - 110, chart.bottom + 22), TextStyle(fontSize: 12, color: textColor));
+      _drawText(canvas, 'RSSI (dBm)', Offset(chart.left, 2), TextStyle(fontSize: 12, color: textColor));
+      return; // No APs to draw
+    }
+
+    // 1. Build and merge active channel ranges
+    final List<_ChannelRange> ranges = [];
+    for (final ap in aps.where((e) => e.channel > 0)) {
+      final widthCh = ap.bandwidthMhz / 5.0;
+      ranges.add((start: ap.channel - widthCh / 2, end: ap.channel + widthCh / 2));
+    }
+    ranges.sort((a, b) => a.start.compareTo(b.start));
+
+    final List<_ChannelRange> activeRanges = [];
+    if (ranges.isNotEmpty) {
+      activeRanges.add(ranges.first);
+      for (int i = 1; i < ranges.length; i++) {
+        final last = activeRanges.last;
+        final current = ranges[i];
+        if (current.start <= last.end) {
+          activeRanges[activeRanges.length - 1] = (start: last.start, end: (last.end > current.end ? last.end : current.end));
+        } else {
+          activeRanges.add(current);
+        }
       }
     }
 
-    // 调色板
+    // 2. Calculate virtual axis metrics
+    const gapEquivalentWidth = 4.0; // A gap is visually as wide as 4 channels
+    final totalActiveSpan = activeRanges.fold(0.0, (sum, r) => sum + (r.end - r.start));
+    final totalGapSpan = (activeRanges.length > 1) ? (activeRanges.length - 1) * gapEquivalentWidth : 0.0;
+    final totalVirtualSpan = totalActiveSpan + totalGapSpan;
+
+    if (totalVirtualSpan <= 0) return; // Edge case
+
+    // 3. Define the new non-linear x-coordinate function
+    double xOf(double channel) {
+      double virtualPos = 0;
+      for (final range in activeRanges) {
+        if (channel >= range.start && channel <= range.end) {
+          virtualPos += channel - range.start;
+          return chart.left + (virtualPos / totalVirtualSpan) * chart.width;
+        }
+        virtualPos += (range.end - range.start) + gapEquivalentWidth;
+      }
+      if (activeRanges.isNotEmpty && channel < activeRanges.first.start) return chart.left;
+      if (activeRanges.isNotEmpty && channel > activeRanges.last.end) return chart.right;
+      return -1;
+    }
+
+    // 4. Draw X-axis labels and gap indicators
+    double lastLabelX = -double.infinity;
+    for (int i = 0; i < activeRanges.length; i++) {
+        final range = activeRanges[i];
+        if (i > 0) {
+            final prevRange = activeRanges[i - 1];
+            final gapStartX = xOf(prevRange.end);
+            final gapEndX = xOf(range.start);
+            _drawText(canvas, '...', Offset((gapStartX + gapEndX) / 2 - 5, chart.bottom + 6),
+                TextStyle(fontSize: 11, color: textColor.withOpacity(0.75)));
+        }
+        final int firstCh = range.start.ceil();
+        final int lastCh = range.end.floor();
+        for (int ch = firstCh; ch <= lastCh; ch++) {
+            bool shouldDraw = (ch % 5 == 0 && ch != 0) || ch == firstCh || ch == lastCh;
+            if (shouldDraw) {
+                final x = xOf(ch.toDouble());
+                final label = '$ch';
+                final textWidth = _measure(label, const TextStyle(fontSize: 11)).width;
+                if (x > lastLabelX + textWidth + 10) {
+                    canvas.drawLine(Offset(x, chart.bottom), Offset(x, chart.bottom + 4), axis);
+                    _drawText(canvas, label, Offset(x - textWidth / 2, chart.bottom + 6),
+                        TextStyle(fontSize: 11, color: textColor.withOpacity(0.75)));
+                    lastLabelX = x;
+                }
+            }
+        }
+    }
+
+    // 5. Draw AP signals using the new xOf function
     final palette = brightness == Brightness.dark
         ? [Colors.cyanAccent, Colors.orangeAccent, Colors.pinkAccent, Colors.lightGreenAccent, Colors.amberAccent, Colors.blueAccent, Colors.limeAccent, Colors.tealAccent]
         : [Colors.blue.shade800, Colors.red.shade700, Colors.green.shade700, Colors.purple.shade700, Colors.orange.shade800, Colors.indigo.shade800, Colors.teal.shade800, Colors.brown.shade700];
 
-    // 平顶台形：左右斜边+平顶，脚落在底线
     int colorIdx = 0;
     int labelIdx = 0;
     final baseY = chart.bottom - 1;
 
     for (final ap in aps.where((e) => e.channel > 0)) {
       final color = palette[colorIdx++ % palette.length];
-
-      final widthCh = (ap.bandwidthMhz / 5.0); // MHz -> 信道宽度
-      final slopeCh = widthCh * 0.18;          // 斜边宽度（18%）
+      final widthCh = (ap.bandwidthMhz / 5.0);
+      final slopeCh = widthCh * 0.18;
       final leftBase = ap.channel - widthCh / 2;
       final rightBase = ap.channel + widthCh / 2;
       final leftTop = leftBase + slopeCh;
       final rightTop = rightBase - slopeCh;
-
       final topY = yOf(ap.rssi);
 
       final path = Path()
-        ..moveTo(xOf(leftBase), baseY)         // 左脚
-        ..lineTo(xOf(leftTop), topY)           // 左斜边上升
-        ..lineTo(xOf(rightTop), topY)          // 平顶
-        ..lineTo(xOf(rightBase), baseY)        // 右斜边下降
+        ..moveTo(xOf(leftBase), baseY)
+        ..lineTo(xOf(leftTop), topY)
+        ..lineTo(xOf(rightTop), topY)
+        ..lineTo(xOf(rightBase), baseY)
         ..close();
 
       final bounds = Rect.fromLTRB(xOf(leftBase), topY, xOf(rightBase), baseY);
       final fill = Paint()
         ..style = PaintingStyle.fill
         ..shader = LinearGradient(
-          begin: Alignment.topCenter,
-          end: Alignment.bottomCenter,
+          begin: Alignment.topCenter, end: Alignment.bottomCenter,
           colors: [color.withOpacity(0.28), color.withOpacity(0.06)],
         ).createShader(bounds);
-      final stroke = Paint()
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 2
-        ..color = color;
+      final stroke = Paint()..style = PaintingStyle.stroke..strokeWidth = 2..color = color;
 
       canvas.drawPath(path, fill);
       canvas.drawPath(path, stroke);
 
-      // 标签（半透明底）
       final label = ap.ssid.isEmpty ? ap.bssid : ap.ssid;
       final tp = _measure(label,
           const TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: Colors.white),
@@ -1573,10 +1618,8 @@ class WifiChartPainter extends CustomPainter {
       tp.paint(canvas, Offset(rect.left + 6, rect.top + 3));
     }
 
-    _drawText(canvas, 'RSSI (dBm)', Offset(chart.left, chart.top - 10),
-        TextStyle(fontSize: 11, color: textColor));
-    _drawText(canvas, '信道 (Channel)', Offset(chart.right - 110, chart.bottom + 22),
-        TextStyle(fontSize: 11, color: textColor));
+    _drawText(canvas, 'RSSI (dBm)', Offset(chart.left, 2), TextStyle(fontSize: 12, color: textColor));
+    _drawText(canvas, '信道 (Channel)', Offset(chart.right - 110, chart.bottom + 22), TextStyle(fontSize: 12, color: textColor));
   }
 
   @override
@@ -1594,7 +1637,6 @@ class WifiChartPainter extends CustomPainter {
   }
 
   void _drawText(Canvas canvas, String s, Offset p, TextStyle style) {
-    final tp = _measure(s, style);
-    tp.paint(canvas, p);
+    _measure(s, style).paint(canvas, p);
   }
 }

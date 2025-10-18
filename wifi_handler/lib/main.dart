@@ -378,6 +378,10 @@ class _HomePageState extends State<HomePage> {
   Band band = Band.any;
 	String? _lastExportUri;
   File? _lastJsonFile; // 最近保存的 JSON
+	double _chartZoom = 1.0; // 新增：图表缩放级别
+  final ScrollController _chartScrollController = ScrollController(); // 新增：图表滚动控制器
+	int _pageIndex = 0; // 新增：页面索引
+	
 	@override
 	void initState() {
 		super.initState();
@@ -701,6 +705,7 @@ class _HomePageState extends State<HomePage> {
   void dispose() {
     remarkCtrl.dispose();
     searchCtrl.dispose();
+		_chartScrollController.dispose(); // 新增：释放控制器
     super.dispose();
   }
   /* ---------- JSON 文件工具 ---------- */
@@ -948,173 +953,258 @@ class _HomePageState extends State<HomePage> {
       return okBand && okQuery;
     }).toList();
   }
+// --- 新增的UI构建方法 ---
 
-  @override
-  Widget build(BuildContext context) {
+  // 构建概览页的 AppBar
+  AppBar _buildOverviewAppBar() {
+    return AppBar(
+			title: const Text('WiFi Handler'),
+      actions: [
+        IconButton(
+          tooltip: '设定导出文件（wifi_scans.jsonl）',
+          onPressed: chooseExportFile,
+          icon: const Icon(Icons.create_new_folder_outlined),
+        ),
+        IconButton(
+          tooltip: '保存当前（追加到同一文件）',
+          onPressed: appendCurrentScanVerbose,
+          icon: const Icon(Icons.download_outlined),
+        ),
+        IconButton(
+          tooltip: '打开导出的 JSON',
+          onPressed: _lastExportUri == null
+              ? null
+              : () => openLastExported(_lastExportUri!),
+          icon: const Icon(Icons.insert_drive_file_outlined),
+        ),
+        IconButton(
+          tooltip: '历史',
+          icon: const Icon(Icons.history),
+          onPressed: () async {
+            if (_lastExportUri == null || _lastExportUri!.isEmpty) {
+              await chooseExportFile();
+              if (_lastExportUri == null || _lastExportUri!.isEmpty) {
+                if (!mounted) return;
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('请先选择/创建历史文件（json/jsonl/jsonl）')),
+                );
+                return;
+              }
+            }
+            final uri = _lastExportUri!;
+            if (!mounted) return;
+            await Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => HistoryPage(externalUri: uri)),
+            );
+          },
+        ),
+      ],
+    );
+  }
+
+  // 构建调试页的 AppBar
+  AppBar _buildDebugAppBar() {
+    return AppBar(
+      title: const Text('调试'),
+      actions: [
+        IconButton(
+          tooltip: '探测历史文件',
+          icon: const Icon(Icons.search),
+          onPressed: _probeHistoryUri,
+        ),
+        IconButton(
+          tooltip: '自检通道',
+          onPressed: _probeChannels,
+          icon: const Icon(Icons.bug_report),
+        ),
+      ],
+    );
+  }
+
+  // 构建概览页的主体内容
+  Widget _buildOverviewBody() {
     final list = _filtered;
-    final hasData = list.isNotEmpty;
-
-    return Scaffold(
-      appBar: AppBar(
-        actions: [
-					IconButton(
-						tooltip: '设定导出文件（wifi_scans.jsonl）',
-						onPressed: chooseExportFile,
-						icon: const Icon(Icons.create_new_folder_outlined),
-					),
-
-					// 步骤 2：把本次扫描追加到同一个文件
-					IconButton(
-						tooltip: '保存当前（追加到同一文件）',
-						onPressed: appendCurrentScanVerbose,
-						icon: const Icon(Icons.download_outlined),
-					),
-
-					IconButton(
-						tooltip: '打开导出的 JSON',
-						onPressed: _lastExportUri == null
-								? null
-								: () => openLastExported(_lastExportUri!),
-						icon: const Icon(Icons.insert_drive_file_outlined), 
-					),
-					IconButton(
-						tooltip: '探测历史文件',
-						icon: const Icon(Icons.search),
-						onPressed: _probeHistoryUri,
-					),
-					IconButton(
-						tooltip: '历史',
-						icon: const Icon(Icons.history),
-						onPressed: () async {
-							if (_lastExportUri == null || _lastExportUri!.isEmpty) {
-								await chooseExportFile();  // 或你自己的 _pickHistoryFile()
-								if (_lastExportUri == null || _lastExportUri!.isEmpty) {
-									ScaffoldMessenger.of(context).showSnackBar(
-										const SnackBar(content: Text('请先选择/创建历史文件（json/jsonl/jsonl）')),
-									);
-									return;
-								}
-							}
-							final uri = _lastExportUri!;               // 此时已保证非空
-							await Navigator.of(context).push(
-								MaterialPageRoute(builder: (_) => HistoryPage(externalUri: uri)),
-							);
-						},
-					),
-					IconButton(
-						tooltip: '自检通道',
-						onPressed: _probeChannels,
-						icon: const Icon(Icons.bug_report),
-					),
-        ],
-      ),
-      body: Column(
-        children: [
-          // 工具条
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
-            child: Column(
-              children: [
-                Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        controller: remarkCtrl,
-                        decoration: const InputDecoration(
-                          labelText: '备注（可选）',
-                          hintText: '例如：客厅，10月7日上午',
-                          border: OutlineInputBorder(),
-                          isDense: true,
-                        ),
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        // 工具条
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
+          child: Column(
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: remarkCtrl,
+                      decoration: const InputDecoration(
+                        labelText: '备注（可选）',
+                        hintText: '例如：客厅，10月7日上午',
+                        border: OutlineInputBorder(),
+                        isDense: true,
                       ),
                     ),
-                    const SizedBox(width: 8),
-                    FilledButton.icon(
-                      onPressed: scanning ? null : scanOnce,
-                      icon: const Icon(Icons.wifi_tethering),
-                      label: Text(scanning ? '扫描中…' : '扫描'),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                Row(
-                  children: [
-                    SegmentedButton<Band>(
-                      segments: const [
-                        ButtonSegment(value: Band.any, label: Text('全部')),
-                        ButtonSegment(value: Band.b24, label: Text('2.4G')),
-                        ButtonSegment(value: Band.b5, label: Text('5G')),
-                        ButtonSegment(value: Band.b6, label: Text('6G')),
-                      ],
-                      selected: {band},
-                      onSelectionChanged: (s) => setState(() => band = s.first),
-                      showSelectedIcon: false,
-                      style: ButtonStyle(
-                        visualDensity: VisualDensity.compact,
-                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: TextField(
-                        controller: searchCtrl,
-                        onChanged: (_) => setState(() {}),
-                        decoration: const InputDecoration(
-                          prefixIcon: Icon(Icons.search),
-                          hintText: '搜索 SSID 或 BSSID',
-                          isDense: true,
-                          border: OutlineInputBorder(),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 6),
-                Align(
-                  alignment: Alignment.centerLeft,
-                  child: Text(
-                    status,
-                    style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant),
                   ),
-                ),
-              ],
-            ),
-          ),
-
-          // 图表
-          Expanded(
-            flex: 6,
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-              child: DecoratedBox(
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(16),
-                  border: Border.all(color: Theme.of(context).colorScheme.outlineVariant, width: 1),
-                ),
-                child: CustomPaint(
-                  painter: WifiChartPainter(aps: list, brightness: Theme.of(context).brightness),
-                  child: const SizedBox.expand(),
+                  const SizedBox(width: 8),
+                  FilledButton.icon(
+                    onPressed: scanning ? null : scanOnce,
+                    icon: const Icon(Icons.wifi_tethering),
+                    label: Text(scanning ? '扫描中…' : '扫描'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  SegmentedButton<Band>(
+                    segments: const [
+                      ButtonSegment(value: Band.any, label: Text('全部')),
+                      ButtonSegment(value: Band.b24, label: Text('2.4G')),
+                      ButtonSegment(value: Band.b5, label: Text('5G')),
+                      ButtonSegment(value: Band.b6, label: Text('6G')),
+                    ],
+                    selected: {band},
+                    onSelectionChanged: (s) => setState(() => band = s.first),
+                    showSelectedIcon: false,
+                    style: const ButtonStyle(
+                      visualDensity: VisualDensity.compact,
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: TextField(
+                      controller: searchCtrl,
+                      onChanged: (_) => setState(() {}),
+                      decoration: const InputDecoration(
+                        prefixIcon: Icon(Icons.search),
+                        hintText: '搜索 SSID 或 BSSID',
+                        isDense: true,
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  status,
+                  style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant),
                 ),
               ),
-            ),
+            ],
           ),
+        ),
+        // 图表
+        Expanded(
+          flex: 10,
+          child: Column(
+            children: [
+              Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(color: Theme.of(context).colorScheme.outlineVariant, width: 1),
+                    ),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(15),
+                      child: SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        controller: _chartScrollController,
+                        child: SizedBox(
+                          width: (MediaQuery.of(context).size.width - 24) * _chartZoom,
+                          child: CustomPaint(
+                            painter: WifiChartPainter(aps: list, brightness: Theme.of(context).brightness),
+                            child: const SizedBox.expand(),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
+                child: Row(
+                  children: [
+                    const Text('缩放'),
+                    Expanded(
+                      child: Slider(
+                        value: _chartZoom,
+                        min: 1.0,
+                        max: 5.0,
+                        divisions: 16,
+                        label: 'x${_chartZoom.toStringAsFixed(1)}',
+                        onChanged: (value) {
+                          setState(() {
+                            _chartZoom = value;
+                          });
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+        // 表格
+        Expanded(
+          flex: 7,
+          child: _ApTable(data: list),
+        ),
+      ],
+    );
+  }
 
-          // 表格（替代之前的横向卡片）
-          Expanded(
-            flex: 7,
-            child: _ApTable(data: list),
+  // 构建调试页的主体内容
+  Widget _buildDebugBody() {
+    return const LogConsole();
+  }
+@override
+  Widget build(BuildContext context) {
+    // 根据当前页面索引，准备好对应的 AppBar 和 body
+    final List<PreferredSizeWidget?> appBars = [
+      _buildOverviewAppBar(),
+      _buildDebugAppBar(),
+    ];
+    final List<Widget> pages = [
+      _buildOverviewBody(),
+      _buildDebugBody(),
+    ];
+
+    return Scaffold(
+      appBar: appBars[_pageIndex],
+      body: pages[_pageIndex],
+      bottomNavigationBar: BottomNavigationBar(
+        currentIndex: _pageIndex,
+        onTap: (index) {
+          setState(() {
+            _pageIndex = index;
+          });
+        },
+        // 使用 .fixed 类型可以确保标签总是可见的
+        type: BottomNavigationBarType.fixed,
+        selectedFontSize: 10.0, // 新增：减小字体，让导航栏更紧凑
+        unselectedFontSize: 10.0, // 新增：减小字体
+        items: const [
+          BottomNavigationBarItem(
+            icon: Icon(Icons.analytics_outlined),
+            label: '概览',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.bug_report_outlined),
+            label: '调试',
           ),
         ],
       ),
-			bottomSheet: ExpansionTile(
-				initiallyExpanded: true, // 需要时改成 false
-				title: const Text('调试面板'),
-				children: const [LogConsole()],
-			),
     );
   }
 }
-
 /* ------------------------------ 表格控件 ------------------------------ */
 
 class _ApTable extends StatelessWidget {
@@ -1406,16 +1496,15 @@ class WifiChartPainter extends CustomPainter {
       return chart.bottom - t * chart.height;
     }
 
-    // 刻度
+		// 刻度
     for (int r = -100; r <= -30; r += 10) {
       final y = yOf(r);
       _drawText(canvas, '$r dBm', Offset(padding.left - 44, y - 7),
           TextStyle(fontSize: 11, color: textColor.withOpacity(0.75)));
     }
     if (occupied.isNotEmpty) {
-      final step = (occupied.length <= 18) ? 1 : (occupied.length / 18).ceil();
-      for (int i = 0; i < occupied.length; i += step) {
-        final ch = occupied[i];
+      // 移除 step 逻辑，直接遍历所有占用的信道
+      for (final ch in occupied) {
         final x = xOf(ch);
         canvas.drawLine(Offset(x, chart.bottom), Offset(x, chart.bottom + 4), axis);
         _drawText(canvas, '$ch', Offset(x - 6, chart.bottom + 6),
@@ -1484,10 +1573,10 @@ class WifiChartPainter extends CustomPainter {
       tp.paint(canvas, Offset(rect.left + 6, rect.top + 3));
     }
 
-    _drawText(canvas, 'RSSI (dBm)', Offset(8, chart.top - 12),
-        TextStyle(fontSize: 12, color: textColor));
+    _drawText(canvas, 'RSSI (dBm)', Offset(chart.left, chart.top - 10),
+        TextStyle(fontSize: 11, color: textColor));
     _drawText(canvas, '信道 (Channel)', Offset(chart.right - 110, chart.bottom + 22),
-        TextStyle(fontSize: 12, color: textColor));
+        TextStyle(fontSize: 11, color: textColor));
   }
 
   @override

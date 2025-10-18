@@ -8,6 +8,67 @@ import { BusinessError } from '@ohos.base';
 import window from '@ohos.window';
 import type { UIContext } from '@ohos.arkui.UIContext';
 
+const HISTORY_FILE = 'history.jsonl';
+
+type HistVal = string | number | boolean | null;
+export interface HistoryRowText { t: number; payload: string; }
+
+
+// ==== UTF-8 编解码，不依赖 @ohos.util ====
+function encodeUtf8(str: string): Uint8Array {
+  const bytes: number[] = [];
+  for (const ch of Array.from(str)) {               // 处理代理对
+    const cp = ch.codePointAt(0)!;
+    if (cp <= 0x7F) {
+      bytes.push(cp);
+    } else if (cp <= 0x7FF) {
+      bytes.push(0xC0 | (cp >> 6), 0x80 | (cp & 0x3F));
+    } else if (cp <= 0xFFFF) {
+      bytes.push(0xE0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F));
+    } else {
+      bytes.push(
+        0xF0 | (cp >> 18),
+        0x80 | ((cp >> 12) & 0x3F),
+        0x80 | ((cp >> 6) & 0x3F),
+        0x80 | (cp & 0x3F)
+      );
+    }
+  }
+  return new Uint8Array(bytes);
+}
+
+function decodeUtf8(bytes: Uint8Array): string {
+  let i = 0, out = '';
+  while (i < bytes.length) {
+    const b1 = bytes[i++];
+    if ((b1 & 0x80) === 0) { out += String.fromCodePoint(b1); continue; }
+    const b2 = bytes[i++] & 0x3F;
+    if ((b1 & 0xE0) === 0xC0) {
+      const cp = ((b1 & 0x1F) << 6) | b2;
+      out += String.fromCodePoint(cp);
+      continue;
+    }
+    const b3 = bytes[i++] & 0x3F;
+    if ((b1 & 0xF0) === 0xE0) {
+      const cp = ((b1 & 0x0F) << 12) | (b2 << 6) | b3;
+      out += String.fromCodePoint(cp);
+      continue;
+    }
+    const b4 = bytes[i++] & 0x3F;
+    const cp = ((b1 & 0x07) << 18) | (b2 << 12) | (b3 << 6) | b4;
+    out += String.fromCodePoint(cp);
+  }
+  return out;
+}
+
+function preview(s: string, maxLen: number): string {
+  const n = s.length <= maxLen ? s.length : maxLen;
+  return s.slice(0, n)
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t');
+}
+
 async function writeBytes(fd: number, buf: Uint8Array): Promise<number> {
   return await fs.write(fd, buf.buffer, {
     offset: buf.byteOffset,
@@ -24,6 +85,153 @@ interface SaveSession { fd: number; uri: string; bytes: number; chunks: number; 
 const saveSessions = new Map<number, SaveSession>();
 let nextSid = 1;
 
+function historyPath(ctx: common.Context): string {
+  return `${ctx.filesDir}/${HISTORY_FILE}`;
+}
+async function ensureFile(ctx: common.Context) {
+  try { await fs.access(historyPath(ctx)); }
+  catch { const fh = await fs.open(historyPath(ctx), fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE); await fs.close(fh); }
+}
+
+function splitTopLevelObjects(input: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let start = -1;
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < input.length; i++) {
+    const ch = input.charAt(i);
+    if (inStr) {
+      if (esc) { esc = false; }
+      else if (ch === '\\') { esc = true; }
+      else if (ch === '"') { inStr = false; }
+      continue;
+    }
+    if (ch === '"') { inStr = true; continue; }
+    if (ch === '{') { if (depth === 0) start = i; depth++; continue; }
+    if (ch === '}') {
+      if (depth > 0) depth--;
+      if (depth === 0 && start >= 0) {
+        out.push(input.slice(start, i + 1));
+        start = -1;
+      }
+    }
+  }
+  return out;
+}
+
+// ===== 辅助：从单个 JSON 片段中提取时间戳（优先 "t":123，其次 "timestamp":"..."）=====
+function tryParseEpochMsFromSegment(seg: string): number {
+  // "t": 123456
+  let p = seg.indexOf('"t"');
+  if (p >= 0) {
+    const colon = seg.indexOf(':', p);
+    if (colon >= 0) {
+      let j = colon + 1;
+      while (j < seg.length && (seg.charAt(j) === ' ' || seg.charAt(j) === '\t')) j++;
+      let k = j;
+      while (k < seg.length) {
+        const c = seg.charCodeAt(k);
+        if (c < 48 || c > 57) break; // 非 0-9
+        k++;
+      }
+      if (k > j) {
+        const v = Number(seg.substring(j, k));
+        if (!Number.isNaN(v)) return v;
+      }
+    }
+  }
+  // "timestamp":"2024-10-18T12:34:56Z"
+  p = seg.indexOf('"timestamp"');
+  if (p >= 0) {
+    const colon = seg.indexOf(':', p);
+    if (colon >= 0) {
+      const q1 = seg.indexOf('"', colon + 1);
+      if (q1 >= 0) {
+        const q2 = seg.indexOf('"', q1 + 1);
+        if (q2 > q1 + 1) {
+          const iso = seg.substring(q1 + 1, q2);
+          const ms = Date.parse(iso);
+          if (!Number.isNaN(ms)) return ms;
+        }
+      }
+    }
+  }
+  return Date.now();
+}
+// 读取整个文件为 UTF-8 文本；stat 失败也能工作
+async function readAllUtf8(uri: string): Promise<string> {
+  let fh: fs.File | null = null;
+  try {
+    fh = await fs.open(uri, fs.OpenMode.READ_ONLY);
+
+    const parts: string[] = [];
+    const chunk = 64 * 1024; // 64KB
+    while (true) {
+      const buf = new ArrayBuffer(chunk);
+      const n = await fs.read(fh.fd, buf);  // 返回本次读到的字节数
+      if (n <= 0) break;
+      parts.push(decodeUtf8(new Uint8Array(buf, 0, n)));
+      if (n < chunk) break; // 读到不足一块 -> EOF
+    }
+    return parts.join('');
+  } finally {
+    if (fh) { try { await fs.close(fh.fd); } catch {} }
+  }
+}
+
+// 固定、简单的类型：记录里只有 t 和 payload，完全避开索引签名/交叉类型
+export interface HistoryRecord {
+  t: number;
+  payload: object;   // 原始对象整体塞这里（ArkTS 允许 object）
+}
+
+// 追加历史
+export async function appendHistory(ctx: common.Context, item: object): Promise<void> {
+  await ensureFile(ctx);
+  const fh = await fs.open(historyPath(ctx), fs.OpenMode.APPEND);
+
+  const rec: HistoryRecord = { t: Date.now(), payload: item };
+  const line = JSON.stringify(rec) + '\n';
+
+  const u8 = encodeUtf8(line);
+  await writeBytes(fh.fd, u8);
+  await fs.close(fh);
+}
+
+// 读取历史（倒序，最多 limit 条）
+export async function listHistoryFromAppFilesDir(ctx: common.Context, limit: number = 200): Promise<HistoryRecord[]> {
+  await ensureFile(ctx);
+  const p = historyPath(ctx);
+  const stat = await fs.stat(p);
+  const fh = await fs.open(p, fs.OpenMode.READ_ONLY);
+  const buf = new ArrayBuffer(stat.size);
+  await fs.read(fh.fd, buf);
+  await fs.close(fh);
+
+  const text = decodeUtf8(new Uint8Array(buf));
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return [];
+
+  const lines = trimmed.split('\n');
+  const out: HistoryRecord[] = [];
+  for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
+    try {
+      const obj = JSON.parse(lines[i]) as HistoryRecord;
+      // 基本健壮性校验
+      if (typeof obj === 'object' && obj !== null && typeof obj.t === 'number') {
+        out.push(obj);
+      }
+    } catch { /* 跳过坏行 */ }
+  }
+  return out;  // 新 -> 旧
+}
+
+// 可选：清空
+export async function clearHistoryInAppFilesDir(ctx: common.Context): Promise<void> {
+  try { await fs.unlink(historyPath(ctx)); } catch {}
+  await ensureFile(ctx);
+}
 
 function getBytesArg(call: MethodCall, key: string): Uint8Array {
   const mc = call as HasArgument;
@@ -443,11 +651,18 @@ export default class EntryAbility extends FlutterAbility {
         try {
           const st = await fs.stat(uri);
           result.success({ ok: true, exists: true, size: st.size });
-        } catch {
-          result.success({ ok: true, exists: false, size: 0 });
+        } catch (_) {
+          try {
+            const fh = await fs.open(uri, fs.OpenMode.READ_ONLY);
+            await fs.close(fh);
+            result.success({ ok: true, exists: true, size: -1 }); // 存在但未知大小
+          } catch {
+            result.success({ ok: true, exists: false, size: 0 });
+          }
         }
         return;
       }
+
 
       if (call.method === 'appendFinish') {
         const sid = Number(getStrArg(call, 'sid', '0'));
@@ -508,6 +723,228 @@ export default class EntryAbility extends FlutterAbility {
       }
 
 
+      if (call.method === 'history.listFromUri') {
+        try {
+          const uri = getStrArg(call, 'uri', '');
+          const limitStr = getStrArg(call, 'limit', '200');
+          const limit = Number(limitStr) > 0 ? Number(limitStr) : 200;
+          emitLog(`[history] listFromUri uri=${uri} limit=${limit}`);
+
+          if (!uri) { result.success({ ok: false, message: 'empty uri', data: [] }); return; }
+
+          // 1) 先尝试 stat，但即使失败也不中断
+          let size = -1;
+          try {
+            const st = await fs.stat(uri);
+            size = st.size;
+            emitLog(`[history] stat ok size=${size}`);
+          } catch (e) {
+            emitLog(`[history] stat FAIL: ${normalizeError(e).message} (will try open+read)`);
+          }
+
+          // 2) 读取全文：若 size>=0 且不大可一次性读；否则走流式
+          let text = '';
+          if (size >= 0 && size <= 8 * 1024 * 1024) {       // 8MB 以内一次性读
+            const fh = await fs.open(uri, fs.OpenMode.READ_ONLY);
+            const buf = new ArrayBuffer(size);
+            const n = await fs.read(fh.fd, buf);
+            await fs.close(fh);
+            emitLog(`[history] read bytes=${n}`);
+            text = decodeUtf8(new Uint8Array(buf, 0, n));
+          } else {
+            text = await readAllUtf8(uri);
+            emitLog(`[history] read(stream) textLen=${text.length}`);
+          }
+
+          const trimmed = text.trim();
+          emitLog(`[history] trimmedLen=${trimmed.length} head="${preview(trimmed, 200)}"`);
+
+          const segs = splitTopLevelObjects(trimmed);
+          emitLog(`[history] segs.count=${segs.length}`);
+          for (let i = 0; i < segs.length && i < 3; i++) {
+            const t0 = tryParseEpochMsFromSegment(segs[i]);
+            emitLog(`[history] seg#${i} len=${segs[i].length} t=${t0} head="${preview(segs[i], 120)}"`);
+          }
+
+          const rows: HistoryRowText[] = [];
+          for (let i = 0; i < segs.length; i++) {
+            const seg = segs[i];
+            const t0 = tryParseEpochMsFromSegment(seg);
+            rows.push({ t: t0, payload: seg });
+          }
+
+          const out = rows.length > limit ? rows.slice(rows.length - limit) : rows;
+          out.reverse(); // 新 -> 旧
+          emitLog(`[history] rows.out=${out.length}`);
+          result.success({ ok: true, data: out, uri });
+        } catch (e) {
+          const err = normalizeError(e);
+          emitLog(`[history] listFromUri ERROR: ${err.message}`);
+          result.success({ ok: false, message: err.message, data: [] });
+        }
+        return;
+      }
+
+      // 从外部 JSON/JSONL 文件中按 t（毫秒时间戳）删除一条
+      if (call.method === 'history.deleteFromUri') {
+        emitLog('ArkTS onFileOps: history.deleteFromUri');
+        const uri = getStrArg(call, 'uri', '');
+        const segArg = getStrArg(call, 'segment', '');   // 可为空
+        const tStr = getStrArg(call, 't', '0');          // 可为空
+        const targetT = Number(tStr);
+
+        if (!uri) { result.success({ ok: false, message: 'empty uri' }); return; }
+
+        try {
+          const text = (await readAllUtf8(uri)).trim();
+          if (text.length === 0) {
+            result.success({ ok: false, message: 'empty file' });
+            return;
+          }
+          const segs = splitTopLevelObjects(text);
+          emitLog(`[delete] total segs=${segs.length}`);
+
+          // 找目标下标
+          let idx = -1;
+
+          // 1) 优先用精确段匹配（传入时最好把原始 payload 文本传回）
+          if (segArg.length > 0) {
+            const target = segArg.trim();
+            for (let i = 0; i < segs.length; i++) {
+              if (segs[i].trim() === target) { idx = i; break; }
+            }
+          }
+
+          // 2) 兜底：按 t 匹配（可能不唯一，取最靠后的一个）
+          if (idx < 0 && targetT > 0) {
+            for (let i = segs.length - 1; i >= 0; i--) {
+              if (tryParseEpochMsFromSegment(segs[i]) === targetT) { idx = i; break; }
+            }
+          }
+
+          if (idx < 0) {
+            emitLog('[delete] target not found');
+            result.success({ ok: false, message: 'not found' });
+            return;
+          }
+
+          // 重新拼接（保留换行）
+          const kept: string[] = [];
+          for (let i = 0; i < segs.length; i++) {
+            if (i !== idx) kept.push(segs[i]);
+          }
+          const newText = kept.join('\n') + (kept.length > 0 ? '\n' : '');
+          emitLog(`[delete] removed idx=${idx} newLen=${newText.length}`);
+
+          // 覆盖写回（TRUNC）
+          const fh = await fs.open(uri, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+          const u8 = encodeUtf8(newText);
+          await writeBytes(fh.fd, u8);
+          await fs.close(fh);
+
+          result.success({ ok: true, removedIndex: idx, totalAfter: kept.length });
+          return;
+        } catch (e) {
+          const err = normalizeError(e);
+          emitLog(`[delete] ERROR: ${err.message}`);
+          result.success({ ok: false, message: err.message });
+          return;
+        }
+      }
+      if (call.method === 'history.peek') {
+        try {
+          const uri = getStrArg(call, 'uri', '');
+          const maxStr = getStrArg(call, 'max', '800');
+          const max = Number(maxStr) > 0 ? Number(maxStr) : 800;
+          if (!uri) { result.success({ ok: false, message: 'empty uri' }); return; }
+
+          const st = await fs.stat(uri);
+          const fh = await fs.open(uri, fs.OpenMode.READ_ONLY);
+          const buf = new ArrayBuffer(st.size);
+          await fs.read(fh.fd, buf);
+          await fs.close(fh);
+
+          const text = decodeUtf8(new Uint8Array(buf));
+          const trimmed = text.trim();
+          const segs = splitTopLevelObjects(trimmed);
+
+          result.success({
+            ok: true,
+            size: st.size,
+            textLen: text.length,
+            trimmedLen: trimmed.length,
+            segs: segs.length,
+            head: preview(trimmed, max),
+            tail: preview(trimmed.length > max ? trimmed.slice(trimmed.length - max) : trimmed, max)
+          });
+        } catch (e) {
+          const err = normalizeError(e);
+          result.success({ ok: false, message: err.message });
+        }
+        return;
+      }
+      // 逐步探测：stat → open → read(256B)，并打印每一步日志
+      if (call.method === 'debug.fsProbe') {
+        const uri = getStrArg(call, 'uri', '');
+        emitLog(`[probe] uri=${uri}`);
+
+        let exists = false;
+        let size = -1;
+        try {
+          const st = await fs.stat(uri);
+          exists = true;
+          size = st.size;
+          emitLog(`[probe] stat ok size=${size}`);
+        } catch (e) {
+          const err = normalizeError(e);
+          emitLog(`[probe] stat FAIL: ${err.message}`);
+        }
+
+        let canOpen = false;
+        let readBytes = 0;
+        let head = '';
+        try {
+          const fh = await fs.open(uri, fs.OpenMode.READ_ONLY);
+          canOpen = true;
+          const buf = new ArrayBuffer(256);
+          readBytes = await fs.read(fh.fd, buf);
+          await fs.close(fh);
+          head = decodeUtf8(new Uint8Array(buf).slice(0, readBytes));
+          emitLog(`[probe] open+read ok n=${readBytes} head="${head.replace(/\n/g,'\\n')}"`);
+        } catch (e) {
+          const err = normalizeError(e);
+          emitLog(`[probe] open/read FAIL: ${err.message}`);
+        }
+
+        result.success({
+          ok: true,
+          exists: exists,
+          size: size,
+          canOpen: canOpen,
+          readBytes: readBytes,
+          head: head.length > 120 ? head.slice(0, 120) : head
+        });
+        return;
+      }
+
+      // 选择一个已有的 JSON/JSONL 文件
+      if (call.method === 'chooseOpenUri') {
+        const ctx = this.context as common.UIAbilityContext;
+        const view = new picker.DocumentViewPicker(ctx);
+        const opts = new picker.DocumentSelectOptions();
+        opts.maxSelectNumber = 1;
+        try {
+          const uris: string[] = await view.select(opts);   // 注意：是 select()（保存是 save()）
+          emitLog(`[file_ops] chooseOpenUri -> ${JSON.stringify(uris)}`);
+          if (!uris || uris.length === 0) { result.success({ ok: false, canceled: true }); return; }
+          result.success({ ok: true, uri: uris[0] });
+        } catch (e) {
+          const err = normalizeError(e);
+          emitLog(`[file_ops] chooseOpenUri ERROR: ${err.message}`);
+          result.error('500', err.message, null);
+        }
+        return;
+      }
 
       // ③ 完成并关闭
       if (call.method === 'saveFinish') {
@@ -556,6 +993,50 @@ export default class EntryAbility extends FlutterAbility {
         })();
         return;
       }
+      // ---- History APIs ----
+      if (call.method === 'history.append') {
+        const mc = call as HasArgument;
+        const item = (typeof mc.argument === 'function') ? mc.argument('item') : undefined;
+        if (!item || typeof item !== 'object') {
+          result.success({ ok: false, message: 'bad item' });
+          return;
+        }
+        try {
+          await appendHistory(this.context as common.Context, item as object);
+          result.success({ ok: true });
+        } catch (e) {
+          const err = normalizeError(e);
+          result.success({ ok: false, message: err.message });
+        }
+        return;
+      }
+
+      if (call.method === 'history.list') {
+        const mc = call as HasArgument;
+        const limAny = (typeof mc.argument === 'function') ? mc.argument('limit') : undefined;
+        const limit = typeof limAny === 'number' ? limAny : 200;
+        try {
+          const data = await listHistoryFromAppFilesDir(this.context as common.Context, limit);
+          result.success({ ok: true, data });   // Dart 侧按前面 HistoryApi.list 去解析
+        } catch (e) {
+          const err = normalizeError(e);
+          result.success({ ok: false, message: err.message, data: [] });
+        }
+        return;
+      }
+
+      if (call.method === 'history.clear') {
+        try {
+          await clearHistoryInAppFilesDir(this.context as common.Context);
+          result.success({ ok: true });
+        } catch (e) {
+          const err = normalizeError(e);
+          result.success({ ok: false, message: err.message });
+        }
+        return;
+      }
+      // ---- end History APIs ----
+
 
       if (call.method === 'saveProbe') {
         const fileName = getStrArg(call, 'fileName', 'probe.json');

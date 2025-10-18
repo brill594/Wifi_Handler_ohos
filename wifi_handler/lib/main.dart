@@ -6,7 +6,8 @@ import 'package:flutter/services.dart';
 import 'dart:ui' show FontFeature;
 import 'dart:convert';
 import 'dart:typed_data';
-
+import '../platform/history_api.dart';
+import '../models/history_record.dart';
 
 
 
@@ -51,7 +52,26 @@ class LogConsole extends StatelessWidget {
                     IconButton(
                       tooltip: '清空',
                       icon: const Icon(Icons.clear_all, size: 18),
-                      onPressed: () => InAppLog.lines.value = <String>[],
+                      onPressed: () async {
+                        // 如果你想“清空历史记录文件”，可以调用这句：
+                        try {
+                          InAppLog.d('历史记录已清空');
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('历史记录已清空')),
+                            );
+                          }
+                        } catch (e) {
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(content: Text('清空历史失败：$e')),
+                            );
+                          }
+                        }
+
+                        // 同时清空“调试日志面板”的日志（可选）
+                        InAppLog.lines.value = <String>[];
+                      },
                     ),
                   ],
                 ),
@@ -73,6 +93,7 @@ class LogConsole extends StatelessWidget {
     );
   }
 }
+
 
 const _fileOps = MethodChannel('file_ops');
 
@@ -374,7 +395,11 @@ class _HomePageState extends State<HomePage> {
 				if (!mounted) return null;
 				if (m['ok'] == true) {
 					final uri = (m['uri'] ?? '').toString();
-					setState(() => _lastExportUri = uri);
+					setState(() {
+							_lastExportUri = uri;
+							_historyUri = uri;                
+						});
+
 					ScaffoldMessenger.of(context).showSnackBar(
 						SnackBar(content: Text('已导出：$uri')),
 					);
@@ -388,6 +413,46 @@ class _HomePageState extends State<HomePage> {
 			return null;
 		});
 	}
+	
+	String? _historyUri;
+
+	Future<void> _pickHistoryFile() async {
+		try {
+			final r = await _fileOps.invokeMethod<Map>('chooseOpenUri', {});
+			if (r?['ok'] == true && r?['uri'] is String) {
+				setState(() => _historyUri = r!['uri'] as String);
+				InAppLog.d('history file = $_historyUri');
+
+				// 选完顺便探测一把，日志会进底部面板
+				final st = await _fileOps.invokeMethod<Map>('statUri', {'uri': _historyUri});
+				InAppLog.d('statUri: $st');
+				final peek = await _fileOps.invokeMethod<Map>('history.peek', {'uri': _historyUri, 'max': 400});
+				InAppLog.d('history.peek: $peek');
+			} else {
+				InAppLog.d('chooseOpenUri canceled: $r');
+			}
+		} catch (e) {
+			InAppLog.d('chooseOpenUri ERROR: $e');
+		}
+	}
+	
+	Future<void> _probeHistoryUri() async {
+		final uri = _historyUri ?? _lastExportUri;
+		if (uri == null || uri.isEmpty) {
+			ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('没有已选历史文件')));
+			return;
+		}
+		try {
+			final stat = await _fileOps.invokeMethod<Map>('statUri', {'uri': uri});
+			InAppLog.d('statUri($uri): $stat');
+
+			final probe = await _fileOps.invokeMethod<Map>('debug.fsProbe', {'uri': uri});
+			InAppLog.d('debug.fsProbe: $probe');
+		} catch (e) {
+			InAppLog.d('probe ERROR: $e');
+		}
+	}
+
 	Future<void> appendCurrentScanVerbose() async {
 		if (_lastExportUri == null) {
 			ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请先设定导出文件')));
@@ -862,14 +927,15 @@ class _HomePageState extends State<HomePage> {
 
   /* ---------- 历史记录（查看/删除） ---------- */
 
-  Future<void> _openHistory() async {
-    final changed = await Navigator.of(context).push<bool>(
-      MaterialPageRoute(builder: (_) => const HistoryPage()),
-    );
-    if (changed == true && mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('历史已更新')));
-    }
-  }
+	Future<void> _openHistory() async {
+		final changed = await Navigator.of(context).push<bool>(
+			MaterialPageRoute(builder: (_) => HistoryPage(externalUri: _lastExportUri)),
+		);
+		if (changed == true && mounted) {
+			ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('历史已更新')));
+		}
+	}
+
 
   /* ---------- 过滤 ---------- */
 
@@ -905,15 +971,36 @@ class _HomePageState extends State<HomePage> {
 					),
 
 					IconButton(
-						tooltip: '打开刚导出的 JSON',
+						tooltip: '打开导出的 JSON',
 						onPressed: _lastExportUri == null
 								? null
 								: () => openLastExported(_lastExportUri!),
-						icon: const Icon(Icons.open_in_new), // 分享先替代为“打开”
+						icon: const Icon(Icons.insert_drive_file_outlined), 
 					),
-			
-          IconButton(tooltip: '历史', onPressed: _openHistory, icon: const Icon(Icons.history)),
-          IconButton(tooltip: '打开 JSON', onPressed: _openJson, icon: const Icon(Icons.insert_drive_file_outlined)),
+					IconButton(
+						tooltip: '探测历史文件',
+						icon: const Icon(Icons.search),
+						onPressed: _probeHistoryUri,
+					),
+					IconButton(
+						tooltip: '历史',
+						icon: const Icon(Icons.history),
+						onPressed: () async {
+							if (_lastExportUri == null || _lastExportUri!.isEmpty) {
+								await chooseExportFile();  // 或你自己的 _pickHistoryFile()
+								if (_lastExportUri == null || _lastExportUri!.isEmpty) {
+									ScaffoldMessenger.of(context).showSnackBar(
+										const SnackBar(content: Text('请先选择/创建历史文件（json/jsonl/jsonl）')),
+									);
+									return;
+								}
+							}
+							final uri = _lastExportUri!;               // 此时已保证非空
+							await Navigator.of(context).push(
+								MaterialPageRoute(builder: (_) => HistoryPage(externalUri: uri)),
+							);
+						},
+					),
 					IconButton(
 						tooltip: '自检通道',
 						onPressed: _probeChannels,
@@ -1171,164 +1258,93 @@ class _ApTable extends StatelessWidget {
 
 /* ------------------------------ 历史页：查看 + 删除 ------------------------------ */
 
+
 class HistoryPage extends StatefulWidget {
-  const HistoryPage({super.key});
+  const HistoryPage({super.key, this.externalUri});
+  final String? externalUri;
   @override
   State<HistoryPage> createState() => _HistoryPageState();
 }
 
 class _HistoryPageState extends State<HistoryPage> {
-  List<dynamic> entries = [];
-  bool loading = true;
+  late Future<List<HistoryRecord>> _future;
 
   @override
   void initState() {
     super.initState();
-    _load();
+    _future = (widget.externalUri != null && widget.externalUri!.isNotEmpty)
+        ? HistoryApi.listFromUri(widget.externalUri!, limit: 200)
+        : Future.value(const <HistoryRecord>[]);
   }
 
-  Future<File> _jsonFile() async {
-    final dir = await getApplicationDocumentsDirectory();
-    return File('${dir.path}/wifi_scans.json');
+  void _reload() {
+    setState(() {
+      _future = (widget.externalUri != null && widget.externalUri!.isNotEmpty)
+          ? HistoryApi.listFromUri(widget.externalUri!, limit: 200)
+          : Future.value(const <HistoryRecord>[]);
+    });
   }
 
-  Future<void> _load() async {
-    final f = await _jsonFile();
-    if (await f.exists()) {
-      final t = await f.readAsString();
-      if (t.trim().isNotEmpty) {
-        try {
-          final v = jsonDecode(t);
-          if (v is List) entries = v;
-        } catch (_) {}
-      }
-    }
-    setState(() => loading = false);
-  }
-
-  Future<void> _persist() async {
-    final f = await _jsonFile();
-    await f.writeAsString(const JsonEncoder.withIndent('  ').convert(entries), flush: true);
-  }
-
-  Future<void> _deleteAt(int index) async {
-    final removed = entries.removeAt(index);
-    await _persist();
-    if (!mounted) return;
-    setState(() {});
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('已删除：${_titleOf(removed)}')),
-    );
-    Navigator.of(context).pop(true);
-  }
-
-  Future<void> _clearAll() async {
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('清空历史？'),
-        content: const Text('这将删除 wifi_scans.json 中的所有记录，不可恢复。'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('取消')),
-          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('清空')),
-        ],
-      ),
-    );
-    if (ok != true) return;
-    entries.clear();
-    await _persist();
-    if (!mounted) return;
-    setState(() {});
-    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已清空历史')));
-    Navigator.of(context).pop(true);
-  }
-
-  String _titleOf(dynamic e) {
-    try {
-      final ts = DateTime.tryParse(e['timestamp'] ?? '')?.toLocal();
-      final remark = (e['remark'] ?? '').toString();
-      final count = e['count'] ?? (e['results'] as List?)?.length ?? 0;
-      final timeStr = ts != null ? ts.toString().replaceFirst('T', ' ').split('.').first : '未知时间';
-      return '$timeStr（$count 条）${remark.isEmpty ? '' : ' · $remark'}';
-    } catch (_) {
-      return '未知记录';
-    }
-  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('历史记录'),
+        title: const Text('历史记录（外部文件）'),
         actions: [
-          IconButton(
-            tooltip: '清空全部',
-            onPressed: entries.isEmpty ? null : _clearAll,
-            icon: const Icon(Icons.delete_forever),
-          ),
+          IconButton(icon: const Icon(Icons.refresh), onPressed: _reload),
+
+
         ],
       ),
-      body: loading
-          ? const Center(child: CircularProgressIndicator())
-          : entries.isEmpty
-          ? const Center(child: Text('暂无历史'))
-          : ListView.separated(
-        itemCount: entries.length,
-        separatorBuilder: (_, __) => const Divider(height: 1),
-        itemBuilder: (ctx, i) {
-          final e = entries[i];
-          final title = _titleOf(e);
-          final results = (e['results'] as List?) ?? [];
-          return Dismissible(
-            key: ValueKey('hist_$i'),
-            direction: DismissDirection.endToStart,
-            background: Container(
-              color: Theme.of(context).colorScheme.errorContainer,
-              alignment: Alignment.centerRight,
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: Icon(Icons.delete, color: Theme.of(context).colorScheme.onErrorContainer),
-            ),
-            confirmDismiss: (_) async {
-              return await showDialog<bool>(
-                context: context,
-                builder: (_) => AlertDialog(
-                  title: const Text('删除这条记录？'),
-                  content: Text(title),
-                  actions: [
-                    TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('取消')),
-                    FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('删除')),
-                  ],
+      body: FutureBuilder<List<HistoryRecord>>(
+        future: _future,
+        builder: (context, snap) {
+          if (snap.connectionState == ConnectionState.waiting) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          final items = snap.data ?? const <HistoryRecord>[];
+          if (items.isEmpty) return const Center(child: Text('暂无历史记录'));
+          return ListView.separated(
+            itemCount: items.length,
+            separatorBuilder: (_, __) => const Divider(height: 1),
+            itemBuilder: (context, i) {
+              final r = items[i];
+              final title = (r.payload['title'] ??
+                             r.payload['ssid'] ??
+                             r.payload['name'] ??
+                             r.payload['text'] ??
+                             '记录').toString();
+              return ListTile(
+                title: Text(title),
+                subtitle: Text('${DateTime.fromMillisecondsSinceEpoch(r.time)} · ${r.payload}',
+                    maxLines: 2, overflow: TextOverflow.ellipsis),
+                trailing: IconButton(
+                  tooltip: '删除这一条',
+                  icon: const Icon(Icons.delete_outline),
+                  onPressed: (widget.externalUri == null)
+                      ? null
+                      : () async {
+                          final ok = await HistoryApi.deleteFromUri(
+                            uri: widget.externalUri!,
+                            t: r.time,
+                          );
+                          if (!mounted) return;
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(content: Text(ok ? '已删除' : '删除失败')),
+                          );
+                          if (ok) _reload();
+                        },
                 ),
               );
             },
-            onDismissed: (_) => _deleteAt(i),
-            child: ListTile(
-              title: Text(title, maxLines: 2, overflow: TextOverflow.ellipsis),
-              subtitle: Text('包含 ${results.length} 个网络'),
-              trailing: IconButton(
-                icon: const Icon(Icons.delete_outline),
-                onPressed: () async {
-                  final ok = await showDialog<bool>(
-                    context: context,
-                    builder: (_) => AlertDialog(
-                      title: const Text('删除这条记录？'),
-                      content: Text(title),
-                      actions: [
-                        TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('取消')),
-                        FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('删除')),
-                      ],
-                    ),
-                  );
-                  if (ok == true) _deleteAt(i);
-                },
-              ),
-            ),
           );
         },
       ),
     );
   }
 }
+
 
 /* ------------------------------ 绘图（平顶台形） ------------------------------ */
 

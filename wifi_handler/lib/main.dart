@@ -10,6 +10,12 @@ import '../platform/history_api.dart';
 import '../models/history_record.dart';
 import 'dart:async';
 import 'package:flutter/services.dart' show rootBundle;
+import 'dart:typed_data';
+import 'package:http/http.dart' as http;
+
+final GlobalKey _aiCardKey = GlobalKey();
+
+
 
 class VendorDb {
   // 使用 Map<String, dynamic> 以匹配 jsonDecode 的结果
@@ -66,7 +72,6 @@ class LogConsole extends StatelessWidget {
             color: Theme.of(context).colorScheme.surface.withOpacity(0.95),
             border: Border(top: BorderSide(color: Theme.of(context).dividerColor)),
           ),
-          height: 220,
           child: Column(
             children: [
               Container(
@@ -124,6 +129,115 @@ class LogConsole extends StatelessWidget {
 
 
 const _fileOps = MethodChannel('file_ops');
+
+// (!!) 新增：设置服务 (纯 Dart 内存版)
+class SettingsService with ChangeNotifier {
+  ThemeMode _themeMode = ThemeMode.system;
+  String _apiKey = '';
+  // (!!) 存储基础域名，而不是完整 URL
+  String _apiBaseDomain = 'api.openai.com'; 
+  String _modelName = 'gpt-4o-mini';
+
+  ThemeMode get themeMode => _themeMode;
+  String get apiKey => _apiKey;
+  // (!!) Getter 动态计算完整 URL
+  String get apiEndpoint {
+    if (_apiBaseDomain.isEmpty) return 'https://api.openai.com/v1/chat/completions';
+    // 自动补全
+    final domain = _apiBaseDomain.replaceAll('http://', '').replaceAll('https://', '');
+    return 'https://$domain/v1/chat/completions';
+  }
+  String get apiBaseDomain => _apiBaseDomain; // (!!) Getter for settings page
+  String get modelName => _modelName; 
+
+  void setThemeMode(ThemeMode mode) {
+    _themeMode = mode;
+    notifyListeners();
+  }
+
+  // (!!) setAiConfig 现在接收 baseDomain
+  void setAiConfig(String key, String baseDomain, String model) {
+    _apiKey = key;
+    // 移除 http(s):// 前缀和末尾的 /
+    _apiBaseDomain = baseDomain
+        .replaceAll('http://', '')
+        .replaceAll('https://', '')
+        .trim();
+    if (_apiBaseDomain.endsWith('/')) {
+       _apiBaseDomain = _apiBaseDomain.substring(0, _apiBaseDomain.length - 1);
+    }
+        
+    if (_apiBaseDomain.isEmpty) _apiBaseDomain = 'api.openai.com';
+    
+    _modelName = model.isEmpty ? 'gpt-4o-mini' : model;
+    notifyListeners();
+  }
+}
+
+class AiAnalyzerService {
+  static Future<String> analyze({
+    required String historyPayloadJson,
+    required String apiKey,
+    required String apiEndpoint,
+    required String languageCode,
+    required String modelName, // (!!) 新增模型参数
+  }) async {
+    if (apiKey.isEmpty) {
+      return '错误：未在设置页面配置 API Key。';
+    }
+
+    // (!!) 修改 Prompt，移除 currentWifiSsid
+    final String prompt = """
+您是一个精通 Wi-Fi 网络优化的助手。请分析以下数据并提供网络改善建议。
+以下 JSON 数据是用户从历史记录中加载的 Wi-Fi 环境快照。'results' 键包含了当时检测到的所有 AP 列表。
+
+请重点分析:
+1. 信道重叠：特别是 2.4GHz 频段（1, 6, 11 信道最佳）。
+2. 信号强度 (rssi)：分析哪些 AP 信号最强，哪些信号最弱。
+3. 网络标准 (standard) 和带宽 (bandwidthMhz)：例如 '802.11ax' 和 '80 MHz'。
+4. 根据整个环境的拥挤程度，为用户提供通用的 Wi-Fi 优化建议（例如：如果 2.4G 拥挤，建议切换到 5G/6G；如果信道重叠严重，建议检查路由器设置并调整信道）。
+
+请必须使用此语言代码进行回复: '$languageCode'。
+
+JSON 数据如下:
+$historyPayloadJson
+""";
+
+    try {
+      final response = await http.post(
+        Uri.parse(apiEndpoint),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $apiKey',
+        },
+        body: jsonEncode({
+          'model': modelName, // (!!) 使用传入的模型
+          'messages': [
+            {'role': 'system', 'content': 'You are a helpful Wi-Fi network assistant.'},
+            {'role': 'user', 'content': prompt},
+          ],
+        }),
+      );
+      // [ ... 后续的 http 逻辑保持不变 ... ]
+      if (response.statusCode == 200) {
+        final body = jsonDecode(utf8.decode(response.bodyBytes));
+        return body['choices'][0]['message']['content'] as String;
+      } else {
+        final errorBody = utf8.decode(response.bodyBytes);
+        InAppLog.d('AI analyze error ${response.statusCode}: $errorBody');
+        return 'AI 分析失败 (Code: ${response.statusCode})：\n$errorBody';
+      }
+    } catch (e) {
+      InAppLog.d('AI analyze request error: $e');
+      return 'AI 请求异常：\n$e';
+    }
+  }
+}
+
+
+// (!!) 全局实例化设置服务
+final SettingsService settingsService = SettingsService();
+
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -218,13 +332,20 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     const seed = Colors.teal;
-    return MaterialApp(
-      title: 'Wi-Fi Analyzer',
-      debugShowCheckedModeBanner: false,
-      themeMode: ThemeMode.system,
-      theme: ThemeData(useMaterial3: true, colorSchemeSeed: seed, brightness: Brightness.light),
-      darkTheme: ThemeData(useMaterial3: true, colorSchemeSeed: seed, brightness: Brightness.dark),
-      home: const HomePage(),
+    
+    // (!!) 将 MaterialApp 包裹在 ListenableBuilder 中以监听主题变化
+    return ListenableBuilder(
+      listenable: settingsService,
+      builder: (context, child) {
+        return MaterialApp(
+          title: 'Wi-Fi Analyzer',
+          debugShowCheckedModeBanner: false,
+          themeMode: settingsService.themeMode, // (!!) 使用服务中的 themeMode
+          theme: ThemeData(useMaterial3: true, colorSchemeSeed: seed, brightness: Brightness.light),
+          darkTheme: ThemeData(useMaterial3: true, colorSchemeSeed: seed, brightness: Brightness.dark),
+          home: const HomePage(),
+        );
+      },
     );
   }
 }
@@ -1208,11 +1329,13 @@ class _HomePageState extends State<HomePage> {
     final List<PreferredSizeWidget?> appBars = [
       _buildOverviewAppBar(),
 			_buildAnalysisAppBar(),
+			AppBar(title: const Text('设置')),
       _buildDebugAppBar(),
     ];
     final List<Widget> pages = [
       _buildOverviewBody(),
 			AnalysisPage(externalUri: _lastExportUri),
+			const SettingsPage(), // (!!) 新增设置页
       _buildDebugBody(),
     ];
 
@@ -1239,6 +1362,10 @@ class _HomePageState extends State<HomePage> {
           BottomNavigationBarItem(
             icon: Icon(Icons.show_chart_outlined),
             label: '分析',
+          ),
+					BottomNavigationBarItem(
+            icon: Icon(Icons.settings_outlined),
+            label: '设置',
           ),
           BottomNavigationBarItem(
             icon: Icon(Icons.bug_report_outlined),
@@ -1720,7 +1847,8 @@ class _AnalysisPageState extends State<AnalysisPage> {
   bool _isMonitoring = false;
   Timer? _monitorTimer;
   String _status = '请先选择要监控的 AP';
-
+	bool _isAiAnalyzing = false;
+  String _aiAnalysisResult = '';
   // 数据
   Set<String> _selectedBssids = {};
   Map<String, List<int>> _history = {};
@@ -1790,7 +1918,54 @@ class _AnalysisPageState extends State<AnalysisPage> {
       ),
     );
   }
+// (!!) 新增：执行 AI 分析
+  Future<void> _runAiAnalysis(HistoryRecord record) async { //
+    setState(() {
+      _isAiAnalyzing = true;
+      _aiAnalysisResult = '正在分析中...';
+    });
+    
+    // 自动滚动到 AI 卡片
+    final ctx = _aiCardKey.currentContext;
+    if (ctx != null) {
+      Scrollable.ensureVisible(ctx, duration: const Duration(milliseconds: 300));
+    }
 
+    // 1. 获取 AI 配置
+    final apiKey = settingsService.apiKey;
+    final apiEndpoint = settingsService.apiEndpoint;
+    if (apiKey.isEmpty) {
+      setState(() {
+        _isAiAnalyzing = false;
+        _aiAnalysisResult = '分析失败：请先在“设置”页面配置 API Key。';
+      });
+      return;
+    }
+
+    // 2. 获取系统语言
+    final lang = View.of(context).platformDispatcher.locale.languageCode;
+
+
+
+
+    // 4. 将 payload 转为 JSON 字符串
+    final historyJson = jsonEncode(record.payload);
+
+    // 5. 调用服务
+    final result = await AiAnalyzerService.analyze(
+      historyPayloadJson: historyJson,
+      apiKey: apiKey,
+      apiEndpoint: apiEndpoint,
+      languageCode: lang,
+			modelName: settingsService.modelName,
+    );
+
+    if (!mounted) return;
+    setState(() {
+      _isAiAnalyzing = false;
+      _aiAnalysisResult = result;
+    });
+  }
   // (!!) 新增：从历史记录加载的逻辑
   Future<void> _loadFromHistory() async {
     // 检查历史文件 URI 是否存在 (从 HomePage 传来)
@@ -1868,7 +2043,10 @@ class _AnalysisPageState extends State<AnalysisPage> {
       _history = newHistory;
       _latestData = newLatestData;
       _status = '已从历史载入 $parsedCount 个 AP';
+			_isAiAnalyzing = false;
+      _aiAnalysisResult = '';
     });
+		_runAiAnalysis(result);
   }
 
   // (!!) 新增：AP.toJson() 的逆向操作，用于解析历史
@@ -2195,6 +2373,40 @@ class _AnalysisPageState extends State<AnalysisPage> {
               return _buildApDetailCard(ap);
             }).toList(),
           ),
+					// (!!) 5. 新增 AI 分析结果卡片
+          if (_aiAnalysisResult.isNotEmpty || _isAiAnalyzing)
+            Padding(
+              key: _aiCardKey, // 绑定 GlobalKey 以便滚动
+              padding: const EdgeInsets.all(12.0),
+              child: Card(
+                elevation: 1,
+                child: Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          const Icon(Icons.auto_awesome, color: Colors.blue),
+                          const SizedBox(width: 8),
+                          Text(
+                            'AI 网络分析',
+                            style: Theme.of(context).textTheme.titleMedium,
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      if (_isAiAnalyzing)
+                        const Center(child: CircularProgressIndicator())
+                      else
+                        SelectableText(_aiAnalysisResult),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          
+          const SizedBox(height: 20),
         ],
       ),
     );
@@ -2365,4 +2577,190 @@ class SignalChartPainter extends CustomPainter {
 String lookupVendor(String bssid) {
   // 代理到新的 VendorDb 类
   return VendorDb.lookup(bssid);
+}
+
+class SettingsPage extends StatefulWidget {
+  const SettingsPage({super.key});
+
+  @override
+  State<SettingsPage> createState() => _SettingsPageState();
+}
+class _SettingsPageState extends State<SettingsPage> {
+  late final TextEditingController _apiKeyCtrl;
+  late final TextEditingController _apiEndpointCtrl;
+  late final TextEditingController _modelCtrl;
+
+  @override
+  void initState() {
+    super.initState();
+    _apiKeyCtrl = TextEditingController(text: settingsService.apiKey);
+    // (!!) 从 apiBaseDomain 初始化
+    _apiEndpointCtrl = TextEditingController(text: settingsService.apiBaseDomain); 
+    _modelCtrl = TextEditingController(text: settingsService.modelName);
+  }
+
+  @override
+  void dispose() {
+    _apiKeyCtrl.dispose();
+    _apiEndpointCtrl.dispose();
+    _modelCtrl.dispose();
+    super.dispose();
+  }
+
+  void _saveSettings() {
+    FocusScope.of(context).unfocus();
+    settingsService.setAiConfig(
+      _apiKeyCtrl.text.trim(),
+      _apiEndpointCtrl.text.trim(), // (!!) 传递的是 baseDomain
+      _modelCtrl.text.trim(),
+    );
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('设置已保存')),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.all(16.0),
+      children: [
+        // --- 外观设置 ---
+        Text('外观', style: Theme.of(context).textTheme.titleSmall),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8.0),
+            child: ListenableBuilder(
+              listenable: settingsService,
+              builder: (context, child) {
+                return Column(
+                  children: [
+                    RadioListTile<ThemeMode>(
+                      title: const Text('跟随系统'),
+                      value: ThemeMode.system,
+                      groupValue: settingsService.themeMode,
+                      onChanged: (v) => settingsService.setThemeMode(v!),
+                    ),
+                    RadioListTile<ThemeMode>(
+                      title: const Text('浅色模式'),
+                      value: ThemeMode.light,
+                      groupValue: settingsService.themeMode,
+                      onChanged: (v) => settingsService.setThemeMode(v!),
+                    ),
+                    RadioListTile<ThemeMode>(
+                      title: const Text('深色模式'),
+                      value: ThemeMode.dark,
+                      groupValue: settingsService.themeMode,
+                      onChanged: (v) => settingsService.setThemeMode(v!),
+                    ),
+                  ],
+                );
+              },
+            ),
+          ),
+        ),
+        const SizedBox(height: 20),
+
+        // --- AI 分析设置 ---
+        Text('AI 分析 (OpenAI 格式)', style: Theme.of(context).textTheme.titleSmall),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16.0),
+            child: Column(
+              children: [
+                TextField(
+                  controller: _apiEndpointCtrl, // (!!) 绑定到 base domain
+                  decoration: const InputDecoration(
+                    labelText: 'API 基础域名', // (!!) 修改标签
+                    border: OutlineInputBorder(),
+                    // (!!) 修改辅助文本
+                    helperText: '例如: api.openai.com\n将自动补全为 https://.../v1/chat/completions', 
+                    hintText: 'api.openai.com',
+                  ),
+                ),
+                const SizedBox(height: 16),
+                TextField(
+                  controller: _modelCtrl,
+                  decoration: const InputDecoration(
+                    labelText: '模型名称',
+                    border: OutlineInputBorder(),
+                    helperText: '例如: gpt-4o-mini',
+                    hintText: 'gpt-4o-mini',
+                  ),
+                ),
+                const SizedBox(height: 16),
+                TextField(
+                  controller: _apiKeyCtrl,
+                  obscureText: true,
+                  decoration: const InputDecoration(
+                    labelText: 'API Key (sk-...)',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                FilledButton(
+                  onPressed: _saveSettings,
+                  child: const Text('保存 AI 设置'),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 20),
+
+        // --- 关于 ---
+        Text('关于', style: Theme.of(context).textTheme.titleSmall),
+        Card(
+          child: ListTile(
+            title: const Text('关于 Wi-Fi Handler'),
+            leading: const Icon(Icons.info_outline),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const AboutPage()),
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+}
+// ===================================================================
+// (!!) 新增：关于页面
+// ===================================================================
+
+class AboutPage extends StatelessWidget {
+  const AboutPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('关于'),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16.0),
+        children: [
+          ListTile(
+            title: const Text('应用名称'),
+            subtitle: const Text('Wi-Fi Handler (Flutter/Harmony)'),
+            leading: Icon(
+              Icons.wifi,
+              color: Theme.of(context).colorScheme.primary,
+            ),
+          ),
+          const ListTile(
+            title: Text('版本'),
+            subtitle: Text('1.0.0 (Dev)'),
+            leading: Icon(Icons.new_releases_outlined),
+          ),
+          const ListTile(
+            title: Text('Author'),
+            subtitle: Text('来自XDU的三名学生'),
+            leading: Icon(Icons.person_outline),
+          ),
+        ],
+      ),
+    );
+  }
 }

@@ -10,7 +10,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-
+  http: ^1.2.1
   # HarmonyOS：获取当前连接信息
   network_info_plus: ^6.0.0
   network_info_plus_ohos: any

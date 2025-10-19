@@ -8,8 +8,36 @@ import 'dart:convert';
 import 'dart:typed_data';
 import '../platform/history_api.dart';
 import '../models/history_record.dart';
+import 'dart:async';
+import 'package:flutter/services.dart' show rootBundle;
 
+class VendorDb {
+  // 使用 Map<String, dynamic> 以匹配 jsonDecode 的结果
+  static Map<String, dynamic> _vendorMap = {};
+  static bool _isInitialized = false;
 
+  /// 应用启动时调用
+  static Future<void> initialize() async {
+    if (_isInitialized) return;
+    try {
+      final jsonString = await rootBundle.loadString('assets/oui_vendor.json');
+      _vendorMap = jsonDecode(jsonString); // 直接加载
+      _isInitialized = true;
+      InAppLog.d('Loaded vendor OUI database with ${_vendorMap.length} entries.');
+    } catch (e) {
+      InAppLog.d('Failed to load vendor OUI database: $e');
+    }
+  }
+
+  /// 查找厂商
+  static String lookup(String bssid) {
+    if (!_isInitialized || bssid.length < 8) return 'Unknown Vendor';
+    // OUI 是前 8 个字符 (AA:BB:CC)
+    final oui = bssid.substring(0, 8).toUpperCase();
+    // 从 Map 中查找，并确保返回 String
+    return (_vendorMap[oui] as String?) ?? 'Unknown Vendor';
+  }
+}
 
 // ===== In-app logger =====
 class InAppLog {
@@ -97,8 +125,9 @@ class LogConsole extends StatelessWidget {
 
 const _fileOps = MethodChannel('file_ops');
 
-void main() {
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+	await VendorDb.initialize();
   runApp(const MyApp());
 }
 const _wifiStdChannel = MethodChannel('wifi_std');
@@ -378,12 +407,13 @@ class _HomePageState extends State<HomePage> {
   Band band = Band.any;
 	String? _lastExportUri;
   File? _lastJsonFile; // 最近保存的 JSON
-	double _chartZoom = 1.0; // 新增：图表缩放级别
-  final ScrollController _chartScrollController = ScrollController(); // 新增：图表滚动控制器
-	int _pageIndex = 0; // 新增：页面索引
+	double _chartZoom = 1.0; 
+  final ScrollController _chartScrollController = ScrollController();
+	int _pageIndex = 0; // <-- 保持不变
 	
 	@override
 	void initState() {
+    // [initState... 保持不变]
 		super.initState();
 
 		_fileOps.setMethodCallHandler((call) async {
@@ -1020,7 +1050,14 @@ class _HomePageState extends State<HomePage> {
       ],
     );
   }
-
+	
+// (!!) 新增：构建分析页的 AppBar
+  AppBar _buildAnalysisAppBar() {
+    return AppBar(
+      title: const Text('分析'),
+    );
+  }
+	
   // 构建概览页的主体内容
   Widget _buildOverviewBody() {
     final list = _filtered;
@@ -1170,14 +1207,16 @@ class _HomePageState extends State<HomePage> {
     // 根据当前页面索引，准备好对应的 AppBar 和 body
     final List<PreferredSizeWidget?> appBars = [
       _buildOverviewAppBar(),
+			_buildAnalysisAppBar(),
       _buildDebugAppBar(),
     ];
     final List<Widget> pages = [
       _buildOverviewBody(),
+			AnalysisPage(externalUri: _lastExportUri),
       _buildDebugBody(),
     ];
 
-    return Scaffold(
+		return Scaffold(
       appBar: appBars[_pageIndex],
       body: pages[_pageIndex],
       bottomNavigationBar: BottomNavigationBar(
@@ -1187,14 +1226,19 @@ class _HomePageState extends State<HomePage> {
             _pageIndex = index;
           });
         },
-        // 使用 .fixed 类型可以确保标签总是可见的
+        // (!!) 修改：确保 .fixed 类型
         type: BottomNavigationBarType.fixed,
-        selectedFontSize: 10.0, // 新增：减小字体，让导航栏更紧凑
-        unselectedFontSize: 10.0, // 新增：减小字体
+        selectedFontSize: 10.0, 
+        unselectedFontSize: 10.0,
         items: const [
           BottomNavigationBarItem(
             icon: Icon(Icons.analytics_outlined),
             label: '概览',
+          ),
+          // (!!) 新增
+          BottomNavigationBarItem(
+            icon: Icon(Icons.show_chart_outlined),
+            label: '分析',
           ),
           BottomNavigationBarItem(
             icon: Icon(Icons.bug_report_outlined),
@@ -1296,7 +1340,7 @@ class _ApTable extends StatelessWidget {
               DataColumn(label: Text('频率')),
               DataColumn(label: Text('信道')),
               DataColumn(label: Text('带宽')),
-              DataColumn(label: Text('标准')), // ← 这里有 ℹ️
+              DataColumn(label: Text('标准')),
             ],
             rows: data.map((ap) {
               return DataRow(cells: [
@@ -1350,8 +1394,15 @@ class _ApTable extends StatelessWidget {
 
 
 class HistoryPage extends StatefulWidget {
-  const HistoryPage({super.key, this.externalUri});
+  // (!!) 修改构造函数
+  const HistoryPage({
+    super.key,
+    this.externalUri,
+    this.isSelectionMode = false, // 默认是查看模式
+  });
   final String? externalUri;
+  final bool isSelectionMode; // (!!) 新增
+
   @override
   State<HistoryPage> createState() => _HistoryPageState();
 }
@@ -1376,15 +1427,16 @@ class _HistoryPageState extends State<HistoryPage> {
   }
 
 
-  @override
+	@override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('历史记录（外部文件）'),
+        // (!!) 修改标题
+        title: Text(widget.isSelectionMode
+            ? '选择一个历史记录'
+            : '历史记录（外部文件）'), //
         actions: [
           IconButton(icon: const Icon(Icons.refresh), onPressed: _reload),
-
-
         ],
       ),
       body: FutureBuilder<List<HistoryRecord>>(
@@ -1400,32 +1452,47 @@ class _HistoryPageState extends State<HistoryPage> {
             separatorBuilder: (_, __) => const Divider(height: 1),
             itemBuilder: (context, i) {
               final r = items[i];
+              //
               final title = (r.payload['title'] ??
-                             r.payload['ssid'] ??
-                             r.payload['name'] ??
-                             r.payload['text'] ??
-                             '记录').toString();
+                      r.payload['remark'] ?? // (!!) 增加 'remark' 字段
+                      r.payload['ssid'] ??
+                      r.payload['name'] ??
+                      r.payload['text'] ??
+                      '记录')
+                  .toString();
               return ListTile(
-                title: Text(title),
-                subtitle: Text('${DateTime.fromMillisecondsSinceEpoch(r.time)} · ${r.payload}',
-                    maxLines: 2, overflow: TextOverflow.ellipsis),
-                trailing: IconButton(
-                  tooltip: '删除这一条',
-                  icon: const Icon(Icons.delete_outline),
-                  onPressed: (widget.externalUri == null)
-                      ? null
-                      : () async {
-                          final ok = await HistoryApi.deleteFromUri(
-                            uri: widget.externalUri!,
-                            t: r.time,
-                          );
-                          if (!mounted) return;
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(content: Text(ok ? '已删除' : '删除失败')),
-                          );
-                          if (ok) _reload();
-                        },
-                ),
+                // (!!) 新增 onTap
+                onTap: widget.isSelectionMode
+                    ? () {
+                        // 如果是选择模式，点击时返回 HistoryRecord
+                        Navigator.of(context).pop(r);
+                      }
+                    : null, // 查看模式下，点击无效果
+                title: Text(title.isEmpty ? '（无备注）' : title),
+                subtitle: Text(
+                    '${DateTime.fromMillisecondsSinceEpoch(r.time)} · ${(r.payload['results'] as List?)?.length ?? 0} 个AP',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis),
+                // (!!) 修改 trailing
+                trailing: widget.isSelectionMode
+                    ? const Icon(Icons.chevron_right) // 选择模式显示箭头
+                    : IconButton( // 查看模式显示删除按钮
+                        tooltip: '删除这一条',
+                        icon: const Icon(Icons.delete_outline),
+                        onPressed: (widget.externalUri == null)
+                            ? null
+                            : () async {
+                                final ok = await HistoryApi.deleteFromUri( //
+                                  uri: widget.externalUri!,
+                                  t: r.time,
+                                );
+                                if (!mounted) return;
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(content: Text(ok ? '已删除' : '删除失败')),
+                                );
+                                if (ok) _reload();
+                              },
+                      ),
               );
             },
           );
@@ -1639,4 +1706,663 @@ class WifiChartPainter extends CustomPainter {
   void _drawText(Canvas canvas, String s, Offset p, TextStyle style) {
     _measure(s, style).paint(canvas, p);
   }
+}
+class AnalysisPage extends StatefulWidget {
+  final String? externalUri;
+  const AnalysisPage({super.key, this.externalUri}); // <-- 修改
+
+  @override
+  State<AnalysisPage> createState() => _AnalysisPageState();
+}
+
+class _AnalysisPageState extends State<AnalysisPage> {
+  // 状态
+  bool _isMonitoring = false;
+  Timer? _monitorTimer;
+  String _status = '请先选择要监控的 AP';
+
+  // 数据
+  Set<String> _selectedBssids = {};
+  Map<String, List<int>> _history = {};
+  Map<String, AP> _latestData = {};
+
+  // 最多保留的数据点
+  static const int _maxHistoryPoints = 150; // (150 点 * 2 秒/点 = 300秒 = 5分钟)
+
+	@override
+  void dispose() {
+    _monitorTimer?.cancel();
+    super.dispose();
+  }
+/// 单个 AP 的详情卡片
+  Widget _buildApDetailCard(AP ap) {
+    final vendor = lookupVendor(ap.bssid); //
+    return Card(
+      margin: const EdgeInsets.only(bottom: 8),
+      child: Padding(
+        padding: const EdgeInsets.all(12.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Text(
+                  ap.ssid.isEmpty ? '<隐藏SSID>' : ap.ssid, //
+                  style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+                ),
+                const Spacer(),
+                Text(
+                  '${ap.rssi} dBm', //
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w700,
+                    color: Theme.of(context).colorScheme.primary,
+                  ),
+                ),
+              ],
+            ),
+            Text(ap.bssid, style: const TextStyle(fontFamily: 'monospace')), //
+            Text(vendor, style: TextStyle(color: Theme.of(context).colorScheme.secondary)),
+            const Divider(height: 16),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                _detailChip('信道', '${ap.channel}'), //
+                _detailChip('频率', '${ap.frequency} MHz'), //
+                _detailChip('带宽', '${ap.bandwidthMhz} MHz'), //
+                _detailChip('标准', ap.standard, flex: 2), //
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _detailChip(String label, String value, {int flex = 1}) {
+    return Expanded(
+      flex: flex,
+      child: Column(
+        children: [
+          Text(label, style: const TextStyle(fontSize: 11, color: Colors.grey)),
+          Text(value, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
+        ],
+      ),
+    );
+  }
+
+  // (!!) 新增：从历史记录加载的逻辑
+  Future<void> _loadFromHistory() async {
+    // 检查历史文件 URI 是否存在 (从 HomePage 传来)
+    if (widget.externalUri == null || widget.externalUri!.isEmpty) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('请先在"概览"页设定一个导出文件')),
+      );
+      return;
+    }
+
+    // 推入 HistoryPage，并等待它返回一个 HistoryRecord
+    final result = await Navigator.of(context).push<HistoryRecord>(
+      MaterialPageRoute(
+        builder: (_) => HistoryPage(
+          externalUri: widget.externalUri,
+          isSelectionMode: true, // (!!) 告诉 HistoryPage 我们是来选条目的
+        ),
+      ),
+    );
+
+    if (!mounted || result == null) return; // 用户取消了选择
+
+    // --- 开始处理返回的 HistoryRecord ---
+    // HistoryRecord.payload 已经是解析过的 Map
+    final payload = result.payload;
+    if (payload['results'] is! List) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('历史记录格式错误：未找到 "results" 列表')),
+      );
+      return;
+    }
+
+    final List<dynamic> rawAps = payload['results'];
+    if (rawAps.isEmpty) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('此历史记录中没有 AP 数据')),
+      );
+      return;
+    }
+
+    // 重置当前状态
+    final newSelectedBssids = <String>{};
+    final newHistory = <String, List<int>>{};
+    final newLatestData = <String, AP>{};
+
+    int parsedCount = 0;
+    for (final rawAp in rawAps.whereType<Map>()) {
+      try {
+        //
+        final ap = _parseApFromJson(rawAp as Map<String, dynamic>);
+        newSelectedBssids.add(ap.bssid);
+        // (!!) 核心：将历史数据作为第一个点 (t=0) 添加
+        newHistory[ap.bssid] = [ap.rssi];
+        newLatestData[ap.bssid] = ap;
+        parsedCount++;
+      } catch (e) {
+        InAppLog.d('Failed to parse AP from history: $e');
+      }
+    }
+
+    if (parsedCount == 0) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('解析历史数据失败')),
+      );
+      return;
+    }
+
+    // 提交新状态
+    setState(() {
+      _selectedBssids = newSelectedBssids;
+      _history = newHistory;
+      _latestData = newLatestData;
+      _status = '已从历史载入 $parsedCount 个 AP';
+    });
+  }
+
+  // (!!) 新增：AP.toJson() 的逆向操作，用于解析历史
+  AP _parseApFromJson(Map<String, dynamic> m) {
+    final freq = (m['frequency_mhz'] as num?)?.toInt() ?? 0;
+    final bw = (m['bandwidth_mhz'] as num?)?.toInt() ?? 20;
+    final caps = (m['capabilities'] as String?) ?? '';
+    
+    // 优先使用历史记录中已存的 standard 字符串
+    final std = m['standard'] as String? ??
+        determineWifiStandard( // 否则重新计算
+          code: (m['wifiStandardCode'] as num?)?.toInt(),
+          capabilities: caps,
+          freq: freq,
+          bw: bw,
+        );
+
+    return AP( //
+      ssid: m['ssid'] as String? ?? '',
+      bssid: (m['bssid'] as String? ?? '').toLowerCase(),
+      rssi: (m['rssi'] as num?)?.toInt() ?? -100,
+      frequency: freq,
+      channel: (m['channel'] as num?)?.toInt() ?? freqToChannel(freq), //
+      bandwidthMhz: bw,
+      standard: std,
+      capabilities: caps,
+      wifiStandardCode: (m['wifiStandardCode'] as num?)?.toInt(),
+      wifiStandardRaw: m['wifiStandardRaw'] as String?,
+      channelWidthRaw: m['channelWidthRaw'] as String?,
+      centerFreq0: (m['centerFreq0'] as num?)?.toInt(),
+      centerFreq1: (m['centerFreq1'] as num?)?.toInt(),
+    );
+  }
+	
+	
+// (!!) 新增：构建图例项的辅助方法
+  List<Widget> _buildLegendItems(Brightness brightness) {
+    final palette = brightness == Brightness.dark
+        ? SignalChartPainter._darkColors
+        : SignalChartPainter._lightColors;
+    int colorIdx = 0;
+    
+    return _history.keys.map((bssid) {
+      final color = palette[colorIdx++ % palette.length];
+      final ap = _latestData[bssid];
+      final label = ap?.ssid.isEmpty == false
+          ? ap!.ssid
+          : (ap?.bssid ?? bssid);
+
+      return Chip(
+        avatar: CircleAvatar(
+          backgroundColor: color,
+          radius: 6, // 小色块
+        ),
+        label: Text(
+          label,
+          style: const TextStyle(fontSize: 12),
+        ),
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+        labelPadding: const EdgeInsets.only(left: 4),
+        side: BorderSide.none,
+        backgroundColor: Theme.of(context).colorScheme.surfaceVariant.withOpacity(0.5),
+      );
+    }).toList();
+  }
+  /// 弹出 AP 选择对话框
+  Future<void> _showSelectApDialog() async {
+    setState(() => _status = '正在扫描可用 AP...');
+    List<AP> allAps = [];
+    try {
+      final raw = await _wifiStdChannel.invokeMethod<List<dynamic>>('scanAndGet') ?? const [];
+      allAps = _mapArkListToAp(raw); // 使用 main.dart 已有的 _mapArkListToAp
+      setState(() => _status = '请选择：');
+    } catch (e) {
+      setState(() => _status = '扫描失败: $e');
+      return;
+    }
+
+    if (!mounted) return;
+
+    // 使用一个临时的 Set 来管理对话框内的勾选状态
+    final tempSelected = Set<String>.from(_selectedBssids);
+
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (dialogContext, dialogSetState) {
+            return AlertDialog(
+              title: const Text('选择要监控的 AP'),
+              content: SizedBox(
+                width: double.maxFinite,
+                child: ListView.builder(
+                  itemCount: allAps.length,
+                  itemBuilder: (_, i) {
+                    final ap = allAps[i];
+                    final isSelected = tempSelected.contains(ap.bssid);
+                    return CheckboxListTile(
+                      title: Text(ap.ssid.isEmpty ? '<隐藏SSID>' : ap.ssid),
+                      subtitle: Text(ap.bssid),
+                      value: isSelected,
+                      onChanged: (val) {
+                        dialogSetState(() {
+                          if (val == true) {
+                            tempSelected.add(ap.bssid);
+                          } else {
+                            tempSelected.remove(ap.bssid);
+                          }
+                        });
+                      },
+                    );
+                  },
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(false),
+                  child: const Text('取消'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(true),
+                  child: const Text('确定'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    // 如果用户点击了“确定”
+    if (result == true) {
+      setState(() {
+        _selectedBssids = tempSelected;
+        _status = '已选择 ${_selectedBssids.length} 个 AP';
+        _initializeHistory();
+      });
+    }
+  }
+
+  /// 根据新的选择，初始化数据结构
+  void _initializeHistory() {
+    _history.clear();
+    _latestData.clear();
+    for (final bssid in _selectedBssids) {
+      _history[bssid] = [];
+    }
+  }
+
+  /// 清空所有历史数据
+  void _clearHistory() {
+    setState(() {
+      _initializeHistory();
+      _status = '已清空历史，共 ${_selectedBssids.length} 个 AP';
+    });
+  }
+
+  /// 开始监控
+  void _startMonitoring() {
+    if (_selectedBssids.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('请先选择要监控的 AP')),
+      );
+      return;
+    }
+    _monitorTimer?.cancel(); // 先停止旧的
+    _monitorTimer = Timer.periodic(const Duration(seconds: 2), _tick);
+    setState(() {
+      _isMonitoring = true;
+      _status = '监控中...';
+    });
+  }
+
+  /// 停止监控
+  void _stopMonitoring() {
+    _monitorTimer?.cancel();
+    setState(() {
+      _isMonitoring = false;
+      _status = '监控已停止';
+    });
+  }
+
+  /// Timer 的回调，核心扫描逻辑
+  Future<void> _tick(Timer t) async {
+    if (!_isMonitoring) {
+      t.cancel();
+      return;
+    }
+
+    List<AP> currentAps = [];
+    try {
+      final raw = await _wifiStdChannel.invokeMethod<List<dynamic>>('scanAndGet') ?? const [];
+      currentAps = _mapArkListToAp(raw);
+    } catch (e) {
+      // 扫描失败，也算一个数据点（-100）
+      InAppLog.d('Analysis tick scan error: $e');
+    }
+
+    // 将列表转为 Map 方便查找
+    final apMap = <String, AP>{for (final ap in currentAps) ap.bssid: ap};
+
+    setState(() {
+      for (final bssid in _selectedBssids) {
+        final ap = apMap[bssid];
+        final rssi = ap?.rssi ?? -100; // 如果 AP 消失了，信号强度记为 -100
+
+        // 添加新数据
+        final historyList = _history[bssid] ?? [];
+        historyList.add(rssi);
+
+        // 裁剪旧数据
+        if (historyList.length > _maxHistoryPoints) {
+          _history[bssid] = historyList.sublist(historyList.length - _maxHistoryPoints);
+        } else {
+          _history[bssid] = historyList;
+        }
+
+
+        // 更新最新详情
+        if (ap != null) {
+          _latestData[bssid] = ap;
+        }
+      }
+    });
+  }
+
+@override
+  Widget build(BuildContext context) {
+    // (!!) 1. 用 SingleChildScrollView 包裹
+    return SingleChildScrollView(
+      child: Column(
+        children: [
+          // 1. 控制栏 (保持不变)
+          Padding(
+            padding: const EdgeInsets.all(12.0),
+            child: Column(
+              children: [
+                Row(
+                  children: [
+                    FilledButton.icon(
+                      icon: const Icon(Icons.playlist_add_check),
+                      label: Text('选择 AP (${_selectedBssids.length})'),
+                      onPressed: _isMonitoring ? null : _showSelectApDialog,
+                    ),
+                    const SizedBox(width: 8),
+                    FilledButton.icon(
+                      icon: const Icon(Icons.history_edu),
+                      label: const Text('从历史载入'),
+                      onPressed: _isMonitoring ? null : _loadFromHistory,
+                      style: FilledButton.styleFrom(
+                        backgroundColor: Theme.of(context).colorScheme.secondary,
+                        foregroundColor: Theme.of(context).colorScheme.onSecondary,
+                      ),
+                    ),
+                    const Spacer(),
+                    IconButton.filled(
+                      icon: Icon(_isMonitoring ? Icons.stop : Icons.play_arrow),
+                      tooltip: _isMonitoring ? '停止监控' : '开始监控',
+                      onPressed: _isMonitoring ? _stopMonitoring : _startMonitoring,
+                    ),
+                    const SizedBox(width: 8),
+                    IconButton(
+                      icon: const Icon(Icons.clear_all),
+                      tooltip: '清空历史',
+                      onPressed: _isMonitoring ? null : _clearHistory,
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    _status,
+                    style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant),
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          // 2. 图表
+          // (!!) 2. 移除 Expanded，替换为 SizedBox
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+            child: SizedBox(
+              height: 300, // (!!) 3. 给予固定的图表高度
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: Theme.of(context).colorScheme.outlineVariant, width: 1),
+                ),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(15),
+                  child: CustomPaint(
+                    painter: SignalChartPainter(
+                      history: _history,
+                      brightness: Theme.of(context).brightness,
+                      maxHistoryPoints: _maxHistoryPoints,
+                    ),
+                    child: const SizedBox.expand(),
+                  ),
+                ),
+              ),
+            ),
+          ),
+
+          // 3. 弹性图例 (保持不变)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+            child: Wrap(
+              spacing: 8.0, // 水平间距
+              runSpacing: 4.0, // 垂直间距
+              children: _buildLegendItems(Theme.of(context).brightness),
+            ),
+          ),
+
+          // 4. 详情卡片
+          // (!!) 4. 移除 Expanded，添加 shrinkWrap 和 physics
+          ListView(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            shrinkWrap: true, // (!!) 5. 让 ListView 根据内容自适应高度
+            physics: const NeverScrollableScrollPhysics(), // (!!) 6. 禁用内部滚动
+            children: _latestData.values.map((ap) {
+              return _buildApDetailCard(ap);
+            }).toList(),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+
+// ===================================================================
+// (!!) 新增：信号分析页的折线图
+// ===================================================================
+
+class SignalChartPainter extends CustomPainter {
+  final Map<String, List<int>> history;
+  final Brightness brightness;
+	final int maxHistoryPoints;
+
+  SignalChartPainter({
+    required this.history,
+    required this.brightness,
+		required this.maxHistoryPoints,
+  });
+
+  static const int minRssi = -100;
+  static const int maxRssi = -30;
+
+  // 颜色循环列表
+	static const List<Color> _darkColors = [
+    Colors.cyanAccent, Colors.orangeAccent, Colors.pinkAccent,
+    Colors.lightGreenAccent, Colors.amberAccent, Colors.blueAccent,
+    Colors.limeAccent, Colors.tealAccent,
+  ];
+  static const List<Color> _lightColors = [
+    Colors.blue, Colors.red, Colors.green,
+    Colors.purple, Colors.orange, Colors.indigo,
+    Colors.teal, Colors.brown,
+  ];
+  
+  // 缓存 TextPainter
+  final Map<String, TextPainter> _labelCache = {};
+
+  TextPainter _measure(String s, TextStyle style, {double maxWidth = 200}) {
+    // 简单缓存
+    if (_labelCache.containsKey(s)) return _labelCache[s]!;
+    final tp = TextPainter(
+      text: TextSpan(text: s, style: style),
+      textDirection: TextDirection.ltr,
+      maxLines: 1,
+      ellipsis: '…',
+    )..layout(minWidth: 0, maxWidth: maxWidth);
+    _labelCache[s] = tp;
+    return tp;
+  }
+
+  void _drawText(Canvas canvas, String s, Offset p, TextStyle style) {
+    _measure(s, style).paint(canvas, p);
+  }
+@override
+  void paint(Canvas canvas, Size size) {
+    // (!!) 恢复底部 padding，因为图例移出去了
+    final padding = const EdgeInsets.fromLTRB(48, 16, 12, 12); 
+    final chart = Rect.fromLTWH(
+      padding.left,
+      padding.top,
+      size.width - padding.left - padding.right,
+      size.height - padding.top - padding.bottom,
+    );
+
+    final textColor = brightness == Brightness.dark ? Colors.white : Colors.black87;
+    final gridColor = (brightness == Brightness.dark ? Colors.white70 : Colors.black87).withOpacity(0.22);
+    final axisColor = gridColor.withOpacity(0.55);
+
+    // --- 绘制 Y 轴 (RSSI) ---
+    final grid = Paint()
+      ..style = PaintingStyle.stroke..strokeWidth = 0.5..color = gridColor;
+    const rows = 7; // -100, -90, ..., -30
+    for (int i = 0; i <= rows; i++) {
+      final y = chart.top + i * chart.height / rows;
+      canvas.drawLine(Offset(chart.left, y), Offset(chart.right, y), grid);
+    }
+    final axis = Paint()
+      ..style = PaintingStyle.stroke..strokeWidth = 1..color = axisColor;
+    canvas.drawRect(chart, axis); // 绘制边框
+
+    double yOf(int rssi) {
+      final rr = rssi.clamp(minRssi, maxRssi).toDouble();
+      final t = (rr - minRssi) / (maxRssi - minRssi); // 0.0 -> 1.0
+      return chart.bottom - t * chart.height;
+    }
+    for (int r = -100; r <= -30; r += 10) {
+      final y = yOf(r);
+      _drawText(canvas, '$r dBm', Offset(padding.left - 44, y - 7),
+          TextStyle(fontSize: 11, color: textColor.withOpacity(0.75)));
+    }
+    // [ ... Y 轴绘制结束 ... ]
+
+
+    // --- 绘制 X 轴 (时间) ---
+    final palette = brightness == Brightness.dark ? _darkColors : _lightColors;
+    int colorIdx = 0;
+
+    int maxLen = maxHistoryPoints; // 使用传入的 maxHistoryPoints
+    if (history.values.isNotEmpty) {
+      final currentMax = history.values.map((e) => e.length).reduce((a, b) => a > b ? a : b);
+      if (currentMax > maxLen) maxLen = currentMax;
+    }
+    if (maxLen <= 1) return; // 至少需要2个点才能画线
+
+    final bssids = history.keys.toList();
+    
+    // (!!) 图例绘制代码已被移除 (!!)
+
+    // --- 绘制折线 ---
+    colorIdx = 0; // 重置颜色索引
+    for (final bssid in bssids) {
+      final color = palette[colorIdx++ % palette.length];
+      final points = history[bssid]!;
+      if (points.length < 2) continue;
+
+      final stroke = Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.5
+        ..color = color;
+
+      // 绘制平滑曲线 (Cubic Bezier Spline)
+      final List<Offset> offsetPoints = [];
+      final int startIdx = (points.length < maxLen) ? (maxLen - points.length) : 0;
+      for (int i = 0; i < points.length; i++) {
+        final x = chart.left + ((i + startIdx) / (maxLen - 1)) * chart.width;
+        final y = yOf(points[i]);
+        offsetPoints.add(Offset(x, y));
+      }
+
+      final path = Path();
+      path.moveTo(offsetPoints[0].dx, offsetPoints[0].dy);
+
+      for (int i = 0; i < offsetPoints.length - 1; i++) {
+        final p_1 = (i == 0) ? offsetPoints[i] : offsetPoints[i - 1];
+        final p0 = offsetPoints[i];
+        final p1 = offsetPoints[i + 1];
+        final p2 = (i >= offsetPoints.length - 2) ? p1 : offsetPoints[i + 2];
+
+        final cp1x = p0.dx + (p1.dx - p_1.dx) / 6.0;
+        final cp1y = p0.dy + (p1.dy - p_1.dy) / 6.0;
+        final cp2x = p1.dx - (p2.dx - p0.dx) / 6.0;
+        final cp2y = p1.dy - (p2.dy - p0.dy) / 6.0;
+
+        path.cubicTo(cp1x, cp1y, cp2x, cp2y, p1.dx, p1.dy);
+      }
+      
+      canvas.drawPath(path, stroke);
+    }
+  }
+
+	@override
+  bool shouldRepaint(covariant SignalChartPainter old) {
+    // 优化：只有在数据或主题变化时才重绘
+    return old.history != history ||
+        old.brightness != brightness ||
+        old.maxHistoryPoints != maxHistoryPoints; // Also check if max points changed
+  }
+}
+
+
+// ===================================================================
+// (!!) 新增：MAC 厂商查询工具
+// ===================================================================
+
+String lookupVendor(String bssid) {
+  // 代理到新的 VendorDb 类
+  return VendorDb.lookup(bssid);
 }

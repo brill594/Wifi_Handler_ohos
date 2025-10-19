@@ -434,21 +434,19 @@ function packOut(it: WifiScanInfo): WifiStdOut {
 let lastScanAt = 0;
 
 export async function scanAndGet(): Promise<WifiStdOut[]> {
-  const now = Date.now();
-  const needScan = (now - lastScanAt) >= 3000;
-  if (needScan) {
-    lastScanAt = now;
+  // 移除缓存逻辑。Flutter 侧控制轮询，ArkTS 侧只管执行
+  lastScanAt = Date.now(); // 仍然更新时间戳，以防万一
+  try {
     try {
-      try {
-        const active = wifiManager.isWifiActive();
-        if (!active) { try { } catch {} }
-      } catch {}
-      wifiManager.scan();
-    } catch (e) {
-      console.warn('[wifi] scan() failed:', normalizeError(e).message);
-    }
+      // 检查 Wi-Fi 是否开启
+      const active = wifiManager.isWifiActive();
+      if (!active) { try { } catch {} }
+    } catch {}
+    // 总是触发一次新扫描
+    wifiManager.scan();
+  } catch (e) {
+    console.warn('[wifi] scan() failed:', normalizeError(e).message);
   }
-  await delay(needScan ? 1300 : 200);
   return getScanListUnique();
 }
 

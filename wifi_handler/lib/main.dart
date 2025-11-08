@@ -338,7 +338,7 @@ class MyApp extends StatelessWidget {
       listenable: settingsService,
       builder: (context, child) {
         return MaterialApp(
-          title: 'Wi-Fi Analyzer',
+          title: 'WiFi Handler',
           debugShowCheckedModeBanner: false,
           themeMode: settingsService.themeMode, // (!!) 使用服务中的 themeMode
           theme: ThemeData(useMaterial3: true, colorSchemeSeed: seed, brightness: Brightness.light),

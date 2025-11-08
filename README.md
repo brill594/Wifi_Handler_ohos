@@ -1,4 +1,4 @@
-# Wi-Fi Handler (Flutter on HarmonyOS)
+# WiFi Handler (HarmonyOS + Flutter)
 
 
 
